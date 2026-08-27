@@ -184,3 +184,39 @@ async def test_final_error_is_not_retried(monkeypatch):
 
     result = await stars._buy_with_retries(Refuses(), "bad", 50, 1)
     assert not result.ok and len(attempts) == 1
+
+
+# --------------------------------------------- подстройка под чужой шлюз
+
+async def test_custom_field_names(gate):
+    client = gate["client"]
+    client.fields = {"username": "recipient", "quantity": "amount", "reference": "order_id"}
+    await client.buy_stars("buyer_one", 100, "order_5")
+    assert gate["seen"][-1]["body"] == {"recipient": "buyer_one", "amount": 100,
+                                        "order_id": "order_5"}
+
+
+async def test_custom_auth_header(gate):
+    client = gate["client"]
+    client.auth_header, client.auth_prefix = "X-API-Key", ""
+    await client.buy_stars("buyer_one", 50, "order_6")
+    headers = gate["seen"][-1]["headers"]
+    assert headers["X-API-Key"] == "secret-token"
+    assert "Authorization" not in headers
+
+
+def test_settings_drive_the_contract(monkeypatch):
+    from config import settings
+
+    monkeypatch.setattr(settings, "fragment_mode", "api")
+    monkeypatch.setattr(settings, "fragment_url", "https://gate.example")
+    monkeypatch.setattr(settings, "fragment_token", "t")
+    monkeypatch.setattr(settings, "fragment_username_field", "recipient")
+    monkeypatch.setattr(settings, "fragment_quantity_field", "amount")
+    monkeypatch.setattr(settings, "fragment_auth_header", "X-Token")
+    monkeypatch.setattr(settings, "fragment_auth_prefix", "")
+
+    client = fragment.get_client()
+    assert client.payload("buyer_one", 50, "order_1") == {
+        "recipient": "buyer_one", "amount": 50, "reference": "order_1"}
+    assert client.auth() == {"X-Token": "t"}

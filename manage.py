@@ -455,6 +455,66 @@ async def cmd_stars(args) -> None:
         done(f"1 TON = {money(rate)} ({source})")
         return
 
+    if args.action == "wallet":
+        import ton
+        if not settings.ton_enabled:
+            fail("TON_WALLET не задан")
+        parsed = ton.parse_address(settings.ton_wallet)
+        if not parsed:
+            fail(f"Адрес не проходит проверку контрольной суммы:\n  {settings.ton_wallet}")
+        title("Кошелёк")
+        print(f"  Адрес:    {settings.ton_wallet}")
+        print(f"  Сеть:     {ton.describe_address(settings.ton_wallet)}")
+        print(f"  API:      {settings.ton_api_url}"
+              f"{' (с ключом)' if settings.ton_api_key else ' (без ключа)'}")
+
+        transactions = await ton.incoming(limit=10)
+        title(f"Последние входящие ({len(transactions)})")
+        table(["сумма, TON", "комментарий", "от кого"],
+              [[t["ton"], short(t["comment"], 24) if t["comment"] else "— без комментария —",
+                short(t["source"], 20)] for t in transactions])
+        if not transactions:
+            print(paint("  Пусто или API недоступен — проверьте TON_API_URL и сеть.", "grey"))
+        return
+
+    if args.action == "gate":
+        import fragment
+        title("Шлюз Fragment")
+        if not settings.fragment_auto:
+            print(f"  Режим:    {paint('ручной', 'yellow')} — бот присылает задачу админу")
+            print(paint("\n  Чтобы включить автозакупку, задайте в .env:", "grey"))
+            print("    FRAGMENT_MODE=api")
+            print("    FRAGMENT_API_URL=https://адрес-шлюза")
+            print("    FRAGMENT_API_TOKEN=токен")
+            return
+
+        print(f"  Режим:    автозакупка")
+        print(f"  Адрес:    {settings.fragment_url}")
+        print(f"  Токен:    {'задан' if settings.fragment_token else paint('НЕ ЗАДАН', 'red')}")
+        client = fragment.get_client()
+        title("Что бот отправит при заказе")
+        print(f"  POST {settings.fragment_url}{settings.fragment_buy_path}")
+        for header, value in client.auth().items():
+            shown = value.replace(settings.fragment_token, "<токен>")
+            print(f"  {header}: {shown}")
+        import json as json_module
+        payload = client.payload("buyer_one", settings.min_stars, "order_1")
+        print(f"  {json_module.dumps(payload, ensure_ascii=False)}")
+        print(paint("\n  Сверьте с документацией шлюза. Другие названия полей или "
+                    "заголовка — это настройки, а не правка кода:", "grey"))
+        print(paint("    FRAGMENT_USERNAME_FIELD, FRAGMENT_QUANTITY_FIELD,", "grey"))
+        print(paint("    FRAGMENT_REFERENCE_FIELD, FRAGMENT_AUTH_HEADER, "
+                    "FRAGMENT_AUTH_PREFIX,", "grey"))
+        print(paint("    FRAGMENT_BUY_PATH, FRAGMENT_BALANCE_PATH", "grey"))
+
+        title("Проверка связи")
+        balance = await client.balance()
+        if balance is None:
+            fail(f"Шлюз не ответил на GET {settings.fragment_url}"
+                 f"{settings.fragment_balance_path} — проверьте адрес, токен и путь")
+        done(f"Шлюз отвечает, баланс: {balance}")
+        return
+
     if args.action == "balance":
         import fragment
         client = fragment.get_client()
@@ -637,10 +697,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- звёзды
     stars_cmd = sub.add_parser(
-        "stars", help="звёзды: price, rate, balance, pending, check, fulfil")
+        "stars", help="звёзды: price, rate, wallet, gate, balance, pending, check, fulfil")
     stars_sub = stars_cmd.add_subparsers(dest="action", required=True, metavar="действие")
     for name, help_text in (("price", "прайс по наборам"),
                             ("rate", "текущий курс TON"),
+                            ("wallet", "кошелёк и последние переводы"),
+                            ("gate", "проверить шлюз Fragment"),
                             ("balance", "баланс шлюза Fragment"),
                             ("pending", "оплачено, но не выдано"),
                             ("check", "разово проверить входящие переводы")):

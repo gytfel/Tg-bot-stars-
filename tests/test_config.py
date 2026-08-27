@@ -7,6 +7,9 @@ import pytest
 from aiogram.types import Chat, ErrorEvent, Message, Update
 
 from config import Settings
+
+VALID_WALLET = "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKZ"
+TESTNET_WALLET = "0QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACkT"
 from utils import escape, money, to_stars
 
 
@@ -14,7 +17,7 @@ def _settings(**kwargs) -> Settings:
     """Рабочая конфигурация магазина звёзд — от неё пляшут остальные проверки."""
     base = Settings(bot_token="123:ABC", admin_ids=[1], mode="polling",
                     shop_mode="stars", payment_currency="RUB",
-                    ton_wallet="UQtest", ton_rate_rub=300)
+                    ton_wallet=VALID_WALLET, ton_rate_rub=300)
     return replace(base, **kwargs)
 
 
@@ -151,3 +154,17 @@ def test_delivery_form_only_for_physical():
     assert _settings(shop_mode="stars").digital is True
     assert _settings(shop_mode="digital").digital is True
     assert _settings(shop_mode="physical").digital is False
+
+
+def test_broken_wallet_is_reported():
+    problems = _settings(ton_wallet=VALID_WALLET[:-1] + "X").validate()
+    assert any("контрольной суммы" in p for p in problems)
+
+
+def test_testnet_wallet_is_reported():
+    problems = _settings(ton_wallet=TESTNET_WALLET).validate()
+    assert any("тестовой сети" in p for p in problems)
+
+
+def test_valid_wallet_passes():
+    assert _settings(ton_wallet=VALID_WALLET).validate() == []

@@ -69,6 +69,12 @@ class Settings:
     fragment_token: str = os.getenv("FRAGMENT_API_TOKEN", "")
     fragment_buy_path: str = os.getenv("FRAGMENT_BUY_PATH", "/buyStars")
     fragment_balance_path: str = os.getenv("FRAGMENT_BALANCE_PATH", "/balance")
+    # у разных шлюзов поля и заголовок авторизации называются по-разному
+    fragment_username_field: str = os.getenv("FRAGMENT_USERNAME_FIELD", "username")
+    fragment_quantity_field: str = os.getenv("FRAGMENT_QUANTITY_FIELD", "quantity")
+    fragment_reference_field: str = os.getenv("FRAGMENT_REFERENCE_FIELD", "reference")
+    fragment_auth_header: str = os.getenv("FRAGMENT_AUTH_HEADER", "Authorization")
+    fragment_auth_prefix: str = os.getenv("FRAGMENT_AUTH_PREFIX", "Bearer")
     fragment_timeout: int = _int("FRAGMENT_TIMEOUT", 60)
     fragment_retries: int = _int("FRAGMENT_RETRIES", 3)
     fragment_min_balance: float = _float("FRAGMENT_MIN_BALANCE", 0)
@@ -79,7 +85,10 @@ class Settings:
     ton_api_key: str = os.getenv("TON_API_KEY", "")
     ton_rate_rub: float = _float("TON_RATE_RUB", 0)    # 0 — брать курс из API
     ton_rate_url: str = os.getenv(
-        "TON_RATE_URL", "https://tonapi.io/v2/rates?tokens=ton&currencies=rub")
+        "TON_RATE_URL",
+        "https://tonapi.io/v2/rates?tokens=ton&currencies=rub"
+        " https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=rub"
+        " https://min-api.cryptocompare.com/data/price?fsym=TON&tsyms=RUB")
     ton_check_interval: int = _int("TON_CHECK_INTERVAL", 60)
     ton_tolerance: float = _float("TON_TOLERANCE", 0.02)   # допуск на комиссию, 2%
     ton_invoice_ttl: int = _int("TON_INVOICE_TTL", 3600)   # сколько ждать оплату, сек
@@ -189,7 +198,21 @@ class Settings:
             problems.append("FRAGMENT_MODE=api требует FRAGMENT_API_URL и FRAGMENT_API_TOKEN")
         if self.ton_enabled and not self.ton_rate_rub and not self.ton_rate_url:
             problems.append("Не задан курс TON: укажите TON_RATE_RUB или TON_RATE_URL")
+        if self.ton_enabled:
+            problems.extend(self._validate_wallet())
         return problems
+
+    def _validate_wallet(self) -> list[str]:
+        from ton import parse_address     # локальный импорт: ton тянет database
+
+        parsed = parse_address(self.ton_wallet)
+        if not parsed:
+            return ["TON_WALLET не проходит проверку контрольной суммы — "
+                    "проверьте, не потерялся ли символ при копировании"]
+        if parsed["testnet"]:
+            return ["TON_WALLET — адрес тестовой сети: настоящие переводы на него "
+                    "не придут"]
+        return []
 
 
 settings = Settings()

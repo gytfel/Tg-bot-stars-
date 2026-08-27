@@ -9,8 +9,10 @@
 """
 
 import asyncio
+import base64
 import logging
 import math
+import re
 import time
 from typing import Any
 
@@ -21,7 +23,59 @@ log = logging.getLogger(__name__)
 
 NANO = 1_000_000_000
 RATE_TTL = 600           # курс TON кэшируем на 10 минут
+RATE_STALE = 3600        # старше часа — продавать по нему уже нельзя
 _rate_cache: tuple[float, float] = (0.0, 0.0)   # (курс, момент получения)
+
+
+# ------------------------------------------------------------------- адрес
+
+def _crc16(data: bytes) -> int:
+    """CRC16-CCITT — им заканчивается любой TON-адрес."""
+    reg = 0
+    for byte in data + b"\x00\x00":
+        mask = 0x80
+        while mask:
+            reg <<= 1
+            if byte & mask:
+                reg += 1
+            mask >>= 1
+            if reg > 0xFFFF:
+                reg &= 0xFFFF
+                reg ^= 0x1021
+    return reg
+
+
+def parse_address(address: str) -> dict | None:
+    """Разобрать адрес кошелька. None — адрес битый (опечатка в символе).
+
+    Возвращает {workchain, testnet, bounceable} — контрольная сумма уже сверена.
+    """
+    value = (address or "").strip()
+    if len(value) != 48:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except Exception:  # noqa: BLE001 — не base64
+        return None
+    if len(raw) != 36:
+        return None
+    if _crc16(raw[:34]).to_bytes(2, "big") != raw[34:]:
+        return None
+
+    flags = raw[0]
+    workchain = raw[1] if raw[1] < 128 else raw[1] - 256
+    return {"workchain": workchain,
+            "testnet": bool(flags & 0x80),
+            "bounceable": not bool(flags & 0x40)}
+
+
+def describe_address(address: str) -> str:
+    parsed = parse_address(address)
+    if not parsed:
+        return "адрес не проходит проверку контрольной суммы"
+    network = "testnet" if parsed["testnet"] else "mainnet"
+    kind = "bounceable" if parsed["bounceable"] else "non-bounceable"
+    return f"{network}, workchain {parsed['workchain']}, {kind}"
 
 
 # --------------------------------------------------------------------- курс
@@ -34,34 +88,55 @@ async def rate_rub(force: bool = False) -> float:
         return settings.ton_rate_rub
 
     rate, fetched_at = _rate_cache
-    if rate and not force and time.time() - fetched_at < RATE_TTL:
+    age = time.time() - fetched_at
+    if rate and not force and age < RATE_TTL:
         return rate
 
     fresh = await _fetch_rate()
     if fresh:
         _rate_cache = (fresh, time.time())
         return fresh
-    if rate:
-        log.warning("Курс TON не обновился, беру прошлый: %s", rate)
+    if rate and age < RATE_STALE:
+        log.warning("Курс TON не обновился, беру прошлый (%.0f мин назад): %s",
+                    age / 60, rate)
         return rate
-    raise RuntimeError("Курс TON недоступен: задайте TON_RATE_RUB в .env")
+    raise RuntimeError("Курс TON недоступен: ни один источник из TON_RATE_URL не "
+                       "ответил. Задайте TON_RATE_RUB в .env, чтобы продавать "
+                       "по фиксированному курсу.")
+
+
+def rate_sources() -> list[str]:
+    """Источники курса из TON_RATE_URL: через пробел или запятую.
+
+    Запятые внутри самого адреса (например `currencies=rub,usd`) не ломают
+    разбор — разделителем считается только запятая перед следующей ссылкой.
+    """
+    parts = re.split(r"\s+|,(?=\s*https?://)", settings.ton_rate_url or "")
+    return [part.strip().rstrip(",") for part in parts if part.strip()]
 
 
 async def _fetch_rate() -> float | None:
+    """Пробуем источники по очереди — первый ответивший выигрывает."""
     import aiohttp
 
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as http:
-            async with http.get(settings.ton_rate_url) as response:
-                if response.status >= 400:
-                    log.warning("Курс TON: API ответил %s", response.status)
-                    return None
-                data = await response.json(content_type=None)
-    except Exception as e:  # noqa: BLE001 — сеть
-        log.warning("Курс TON не получен: %s", e)
-        return None
-    return _find_rate(data)
+    timeout = aiohttp.ClientTimeout(total=15)
+    for url in rate_sources():
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as http:
+                async with http.get(url) as response:
+                    if response.status >= 400:
+                        log.warning("Курс TON: %s ответил %s", url, response.status)
+                        continue
+                    data = await response.json(content_type=None)
+        except Exception as e:  # noqa: BLE001 — сеть
+            log.warning("Курс TON не получен из %s: %s", url, e)
+            continue
+        rate = _find_rate(data)
+        if rate:
+            log.debug("Курс TON %s из %s", rate, url)
+            return rate
+        log.warning("Курс TON: %s ответил без понятного числа", url)
+    return None
 
 
 def _find_rate(data: Any) -> float | None:

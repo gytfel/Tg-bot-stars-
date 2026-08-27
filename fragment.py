@@ -65,17 +65,34 @@ class ApiFragment:
     mode = "api"
 
     def __init__(self, url: str, token: str, buy_path: str, balance_path: str,
-                 timeout: int) -> None:
+                 timeout: int, fields: dict | None = None,
+                 auth_header: str = "Authorization", auth_prefix: str = "Bearer") -> None:
         self.url = url.rstrip("/")
         self.token = token
         self.buy_path = buy_path
         self.balance_path = balance_path
         self.timeout = timeout
+        # имена полей запроса: у разных шлюзов свои
+        self.fields = fields or {"username": "username", "quantity": "quantity",
+                                 "reference": "reference"}
+        self.auth_header = auth_header
+        self.auth_prefix = auth_prefix
+
+    def payload(self, username: str, quantity: int, reference: str) -> dict:
+        return {self.fields["username"]: username,
+                self.fields["quantity"]: quantity,
+                self.fields["reference"]: reference}
+
+    def auth(self) -> dict:
+        if not self.token:
+            return {}
+        value = f"{self.auth_prefix} {self.token}".strip() if self.auth_prefix else self.token
+        return {self.auth_header: value}
 
     # --------------------------------------------------------------- запросы
 
     async def buy_stars(self, username: str, quantity: int, reference: str) -> Purchase:
-        payload = {"username": username, "quantity": quantity, "reference": reference}
+        payload = self.payload(username, quantity, reference)
         status, data, error = await self._request("POST", self.buy_path, json=payload)
 
         if error:
@@ -102,9 +119,7 @@ class ApiFragment:
                        json: dict | None = None) -> tuple[int, Any, str | None]:
         import aiohttp
 
-        headers = {"Accept": "application/json"}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+        headers = {"Accept": "application/json", **self.auth()}
 
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         try:
@@ -198,7 +213,13 @@ def _number_of(data: Any) -> float | None:
 def get_client():
     """Клиент по текущим настройкам."""
     if settings.fragment_auto:
-        return ApiFragment(settings.fragment_url, settings.fragment_token,
-                           settings.fragment_buy_path, settings.fragment_balance_path,
-                           settings.fragment_timeout)
+        return ApiFragment(
+            settings.fragment_url, settings.fragment_token,
+            settings.fragment_buy_path, settings.fragment_balance_path,
+            settings.fragment_timeout,
+            fields={"username": settings.fragment_username_field,
+                    "quantity": settings.fragment_quantity_field,
+                    "reference": settings.fragment_reference_field},
+            auth_header=settings.fragment_auth_header,
+            auth_prefix=settings.fragment_auth_prefix)
     return ManualFragment()

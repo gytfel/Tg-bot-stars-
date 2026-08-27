@@ -13,7 +13,7 @@ from conftest import USER_ID
 TONCENTER = {
     "transactions": [
         {"hash": "tx_toncenter",
-         "in_msg": {"source": "UQbuyer", "destination": "UQshop", "value": "500000000",
+         "in_msg": {"source": "UQbuyer", "destination": "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKZ", "value": "500000000",
                     "message_content": {"decoded": {"type": "text_comment",
                                                     "comment": "order_42"}}}},
         {"hash": "tx_outgoing", "out_msgs": [{"value": "100"}]},
@@ -35,7 +35,7 @@ TONAPI = {
 def ton_settings(monkeypatch):
     from config import settings
     monkeypatch.setattr(settings, "shop_mode", "stars")
-    monkeypatch.setattr(settings, "ton_wallet", "UQshop")
+    monkeypatch.setattr(settings, "ton_wallet", "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKZ")
     monkeypatch.setattr(settings, "ton_rate_rub", 320.0)
     monkeypatch.setattr(settings, "ton_tolerance", 0.02)
     return settings
@@ -115,7 +115,7 @@ def test_comment_carries_the_order_number():
 
 def test_invoice_names_wallet_and_comment(ton_settings):
     text = ton.invoice_text({"ton_amount": 0.5, "ton_comment": "order_7"})
-    assert "0.5 TON" in text and "UQshop" in text and "order_7" in text
+    assert "0.5 TON" in text and "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKZ" in text and "order_7" in text
 
 
 # --------------------------------------------------------------- транзакции
@@ -248,3 +248,141 @@ async def test_payment_is_credited_once(bot, db_file, inbox, auto_fragment):
 
     assert await ton.check_pending(bot) == 1
     assert await ton.check_pending(bot) == 0, "оплаченный заказ больше не проверяется"
+
+
+# ------------------------------------------------------------------- адрес
+
+VALID = "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKZ"
+TESTNET = "0QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACkT"
+REAL = "UQDjKyZ9Do1_sYvoFcZmntJ7KDKQvVvB-Gsb-jFSezNXvUxQ"
+
+
+def test_real_address_passes_checksum():
+    parsed = ton.parse_address(REAL)
+    assert parsed == {"workchain": 0, "testnet": False, "bounceable": False}
+    assert ton.describe_address(REAL) == "mainnet, workchain 0, non-bounceable"
+
+
+def test_testnet_address_is_flagged():
+    assert ton.parse_address(TESTNET)["testnet"] is True
+
+
+@pytest.mark.parametrize("broken", [
+    "",                       # пусто
+    "UQtest",                 # слишком коротко
+    REAL[:-1] + "X",          # одна буква изменена — контрольная сумма не сойдётся
+    REAL[:-1],                # потерян символ
+    REAL + "A",               # лишний символ
+    "не адрес вовсе",
+    "0:e32b267d0e8d7fb18be815c6669ed27b283290bd5bc1f86b1bfa31527b3357bd",  # raw-форма
+])
+def test_broken_addresses_are_rejected(broken):
+    assert ton.parse_address(broken) is None
+
+
+def test_every_single_character_typo_is_caught():
+    """Контрольная сумма должна ловить замену любого символа адреса."""
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    missed = []
+    for position in range(len(REAL)):
+        for char in alphabet:
+            if char == REAL[position]:
+                continue
+            candidate = REAL[:position] + char + REAL[position + 1:]
+            if ton.parse_address(candidate):
+                missed.append(candidate)
+    assert not missed, f"опечатки прошли проверку: {missed[:3]}"
+
+
+# --------------------------------------------------------- источники курса
+
+@pytest.mark.parametrize("value,count", [
+    ("https://a.example https://b.example", 2),
+    ("https://a.example, https://b.example", 2),
+    ("https://tonapi.io/v2/rates?tokens=ton&currencies=rub,usd", 1),
+    ("https://one.example", 1),
+    ("", 0),
+])
+def test_rate_sources_split(monkeypatch, value, count):
+    from config import settings
+    monkeypatch.setattr(settings, "ton_rate_url", value)
+    assert len(ton.rate_sources()) == count
+
+
+async def test_first_working_source_wins(ton_settings, monkeypatch):
+    monkeypatch.setattr(ton_settings, "ton_rate_rub", 0)
+    monkeypatch.setattr(ton, "_rate_cache", (0.0, 0.0))
+    monkeypatch.setattr(ton_settings, "ton_rate_url",
+                        "https://dead.example https://alive.example")
+    asked = []
+
+    class Response:
+        def __init__(self, url):
+            self.url = url
+            self.status = 500 if "dead" in url else 200
+
+        async def json(self, content_type=None):
+            return {"rates": {"TON": {"prices": {"RUB": 305.5}}}}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+    class Session:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get(self, url):
+            asked.append(url)
+            return Response(url)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+    import aiohttp
+    monkeypatch.setattr(aiohttp, "ClientSession", Session)
+
+    assert await ton.rate_rub() == 305.5
+    assert asked == ["https://dead.example", "https://alive.example"]
+
+
+async def test_stale_rate_is_refused(ton_settings, monkeypatch):
+    """Курс двухчасовой давности — не курс: лучше не продать, чем продать в минус."""
+    import time
+
+    monkeypatch.setattr(ton_settings, "ton_rate_rub", 0)
+    monkeypatch.setattr(ton, "_rate_cache", (300.0, time.time() - 7200))
+
+    async def nothing():
+        return None
+
+    monkeypatch.setattr(ton, "_fetch_rate", nothing)
+    with pytest.raises(RuntimeError, match="TON_RATE_RUB"):
+        await ton.rate_rub()
+
+
+async def test_recent_rate_survives_api_outage(ton_settings, monkeypatch):
+    import time
+
+    monkeypatch.setattr(ton_settings, "ton_rate_rub", 0)
+    monkeypatch.setattr(ton, "_rate_cache", (300.0, time.time() - 900))
+
+    async def nothing():
+        return None
+
+    monkeypatch.setattr(ton, "_fetch_rate", nothing)
+    assert await ton.rate_rub() == 300.0
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"rates": {"TON": {"prices": {"RUB": 305.5}}}}, 305.5),          # tonapi
+    ({"the-open-network": {"rub": 305.5}}, 305.5),                    # coingecko
+    ({"RUB": 305.5}, 305.5),                                          # cryptocompare
+])
+def test_rate_shapes_of_real_services(payload, expected):
+    assert ton._find_rate(payload) == expected

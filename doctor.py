@@ -111,9 +111,16 @@ async def check_stars_shop() -> bool:
 
     # --- приём оплаты
     if settings.ton_enabled:
-        line(OK, f"Оплата в TON на {settings.ton_wallet}")
+        import ton
+        if not ton.parse_address(settings.ton_wallet):
+            line(FAIL, f"TON_WALLET не проходит проверку контрольной суммы: "
+                       f"{settings.ton_wallet}")
+            return False
+        line(OK, f"Кошелёк: {settings.ton_wallet}")
+        line(OK, f"Адрес: {ton.describe_address(settings.ton_wallet)}")
+        if not settings.ton_rate_rub:
+            line(OK, f"Источников курса: {len(ton.rate_sources())}")
         try:
-            import ton
             rate = await ton.rate_rub()
             source = "из .env" if settings.ton_rate_rub else "из API"
             line(OK, f"Курс: 1 TON = {rate} {settings.currency} ({source})")
@@ -121,7 +128,7 @@ async def check_stars_shop() -> bool:
             line(OK, f"Минимальный заказ: {settings.min_stars} ⭐ = {example} "
                      f"{settings.currency} = {ton.to_ton(example, rate)} TON")
         except Exception as e:  # noqa: BLE001
-            line(FAIL, f"Курс TON недоступен: {e}")
+            line(FAIL, str(e))
             ok = False
     elif settings.payment_token:
         line(WARN, "TON не настроен, оплата пойдёт через платёжного провайдера")

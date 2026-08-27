@@ -264,7 +264,7 @@ def stars_mode(monkeypatch):
     monkeypatch.setattr(settings, "star_price", 1.6)
     monkeypatch.setattr(settings, "min_stars", 50)
     monkeypatch.setattr(settings, "star_packages", [50, 100, 1000])
-    monkeypatch.setattr(settings, "ton_wallet", "UQshop")
+    monkeypatch.setattr(settings, "ton_wallet", "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKZ")
     monkeypatch.setattr(settings, "ton_rate_rub", 320.0)
     return settings
 
@@ -380,3 +380,84 @@ def test_order_card_shows_ton_details(star_order, capsys):
     out = capsys.readouterr().out
     assert "500 ⭐ → @buyer_one" in out
     assert "2.5" in out and f"order_{star_order}" in out
+
+
+def _answer(value):
+    """Подменить сетевой вызов готовым ответом."""
+    async def answer():
+        return value
+
+    return answer
+
+
+def test_gate_explains_manual_mode(stars_mode, db_file, capsys):
+    run("stars", "gate")
+    out = capsys.readouterr().out
+    assert "ручной" in out and "FRAGMENT_MODE=api" in out
+
+
+def test_gate_checks_the_connection(stars_mode, db_file, monkeypatch, capsys):
+    import fragment
+    from config import settings
+
+    monkeypatch.setattr(settings, "fragment_mode", "api")
+    monkeypatch.setattr(settings, "fragment_url", "https://gate.example")
+    monkeypatch.setattr(settings, "fragment_token", "secret")
+
+    def stub():
+        client = fragment.ApiFragment("https://gate.example", "secret",
+                                      "/buyStars", "/balance", timeout=5)
+        client.balance = _answer(12.5)
+        return client
+
+    monkeypatch.setattr(fragment, "get_client", stub)
+    run("stars", "gate")
+    out = capsys.readouterr().out
+    assert "https://gate.example/buyStars" in out
+    assert '"quantity": 50' in out, "должно быть видно, что именно уйдёт в шлюз"
+    assert "баланс: 12.5" in out
+
+
+def test_gate_reports_a_silent_gateway(stars_mode, db_file, monkeypatch, capsys):
+    import fragment
+    from config import settings
+
+    monkeypatch.setattr(settings, "fragment_mode", "api")
+    monkeypatch.setattr(settings, "fragment_url", "https://gate.example")
+    monkeypatch.setattr(settings, "fragment_token", "secret")
+
+    def stub():
+        client = fragment.ApiFragment("https://gate.example", "secret",
+                                      "/buyStars", "/balance", timeout=5)
+        client.balance = _answer(None)
+        return client
+
+    monkeypatch.setattr(fragment, "get_client", stub)
+    with pytest.raises(SystemExit):
+        run("stars", "gate")
+    assert "не ответил" in capsys.readouterr().out
+
+
+def test_wallet_shows_address_and_transfers(stars_mode, db_file, monkeypatch, capsys):
+    import ton
+
+    async def incoming(limit=100):
+        return [{"ton": 2.5, "comment": "order_42", "hash": "h", "source": "UQbuyer"},
+                {"ton": 0.5, "comment": "", "hash": "h2", "source": "UQother"}]
+
+    monkeypatch.setattr(ton, "incoming", incoming)
+    run("stars", "wallet")
+    out = capsys.readouterr().out
+    assert "mainnet, workchain 0" in out
+    assert "order_42" in out
+    assert "без комментария" in out
+
+
+def test_wallet_rejects_a_typo(stars_mode, db_file, monkeypatch, capsys):
+    from config import settings
+    from test_config import VALID_WALLET
+
+    monkeypatch.setattr(settings, "ton_wallet", VALID_WALLET[:-1] + "X")
+    with pytest.raises(SystemExit):
+        run("stars", "wallet")
+    assert "контрольной суммы" in capsys.readouterr().out

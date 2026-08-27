@@ -16,7 +16,7 @@ def stars_shop(monkeypatch):
     monkeypatch.setattr(settings, "payment_currency", "RUB")
     monkeypatch.setattr(settings, "star_price", 1.6)
     monkeypatch.setattr(settings, "min_stars", 50)
-    monkeypatch.setattr(settings, "ton_wallet", "UQtest_wallet")
+    monkeypatch.setattr(settings, "ton_wallet", "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKZ")
     monkeypatch.setattr(settings, "ton_rate_rub", 320.0)
     return settings
 
@@ -147,7 +147,7 @@ async def test_full_purchase_creates_ton_invoice(dp, bot, session, db_file):
     assert order["ton_amount"] == pytest.approx(0.5, abs=0.001)   # 160 ₽ / 320 ₽ за TON
 
     invoice = session.last_text()
-    assert "UQtest_wallet" in invoice and order["ton_comment"] in invoice
+    assert "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKZ" in invoice and order["ton_comment"] in invoice
 
 
 async def test_payment_is_matched_and_stars_are_bought(dp, bot, session, db_file,
