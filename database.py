@@ -51,7 +51,10 @@ CREATE TABLE IF NOT EXISTS orders (
     comment        TEXT,
     payment_method TEXT,
     status         TEXT NOT NULL DEFAULT 'new',
-    created_at     TEXT NOT NULL
+    created_at     TEXT NOT NULL,
+    currency       TEXT,
+    charge_id      TEXT,
+    paid_at        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS order_items (
@@ -62,14 +65,31 @@ CREATE TABLE IF NOT EXISTS order_items (
     price      REAL NOT NULL,
     quantity   INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_orders_user   ON orders(user_id);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_items_order   ON order_items(order_id);
+CREATE INDEX IF NOT EXISTS idx_products_cat  ON products(category_id);
 """
+
+# столбцы, добавленные после первого релиза: докатываем на живой базе
+MIGRATIONS = {
+    "orders": {
+        "currency": "ALTER TABLE orders ADD COLUMN currency TEXT",
+        "charge_id": "ALTER TABLE orders ADD COLUMN charge_id TEXT",
+        "paid_at": "ALTER TABLE orders ADD COLUMN paid_at TEXT",
+    },
+}
 
 
 @asynccontextmanager
 async def db():
-    conn = await aiosqlite.connect(settings.db_path)
+    conn = await aiosqlite.connect(settings.db_path, timeout=30)
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys = ON")
+    # WAL + ожидание блокировки: бот и бэкап/просмотр базы не мешают друг другу
+    await conn.execute("PRAGMA journal_mode = WAL")
+    await conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         await conn.commit()
@@ -80,6 +100,12 @@ async def db():
 async def init_db() -> None:
     async with db() as conn:
         await conn.executescript(SCHEMA)
+        for table, columns in MIGRATIONS.items():
+            rows = await (await conn.execute(f"PRAGMA table_info({table})")).fetchall()
+            existing = {r["name"] for r in rows}
+            for column, sql in columns.items():
+                if column not in existing:
+                    await conn.execute(sql)
 
 
 # ---------------------------------------------------------------- пользователи
@@ -222,16 +248,24 @@ def cart_total(items: list[dict]) -> float:
 
 # -------------------------------------------------------------------- заказы
 
-async def create_order(user_id: int, data: dict, items: list[dict]) -> int:
+async def create_order(user_id: int, data: dict, items: list[dict],
+                       status: str = "new", commit_stock: bool = True,
+                       clear_cart: bool = True) -> int:
+    """Создать заказ.
+
+    Для онлайн-оплаты заказ создаётся со статусом `pending`: склад и корзина
+    не трогаются, пока Telegram не подтвердит платёж (см. `mark_paid`).
+    """
     total = cart_total(items)
     async with db() as conn:
         cur = await conn.execute(
             """INSERT INTO orders
-               (user_id, total, name, phone, address, comment, payment_method, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?)""",
+               (user_id, total, name, phone, address, comment, payment_method,
+                status, created_at, currency)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user_id, total, data.get("name"), data.get("phone"), data.get("address"),
-             data.get("comment"), data.get("payment"),
-             datetime.now().isoformat(timespec="seconds")),
+             data.get("comment"), data.get("payment"), status,
+             datetime.now().isoformat(timespec="seconds"), data.get("currency")),
         )
         order_id = cur.lastrowid
         for it in items:
@@ -240,12 +274,52 @@ async def create_order(user_id: int, data: dict, items: list[dict]) -> int:
                    VALUES (?, ?, ?, ?, ?)""",
                 (order_id, it["product_id"], it["title"], it["price"], it["quantity"]),
             )
-            await conn.execute(
-                "UPDATE products SET stock = MAX(stock - ?, 0) WHERE id = ?",
-                (it["quantity"], it["product_id"]),
-            )
-        await conn.execute("DELETE FROM cart_items WHERE user_id = ?", (user_id,))
+            if commit_stock:
+                await conn.execute(
+                    "UPDATE products SET stock = MAX(stock - ?, 0) WHERE id = ?",
+                    (it["quantity"], it["product_id"]),
+                )
+        if clear_cart:
+            await conn.execute("DELETE FROM cart_items WHERE user_id = ?", (user_id,))
     return order_id
+
+
+async def mark_paid(order_id: int, charge_id: str | None = None,
+                    currency: str | None = None) -> bool:
+    """Подтвердить оплату заказа. Идемпотентно: повторный вызов вернёт False.
+
+    Списывает склад и чистит корзину — то, что не делалось при `pending`.
+    """
+    async with db() as conn:
+        row = await (await conn.execute(
+            "SELECT user_id, status FROM orders WHERE id = ?", (order_id,))).fetchone()
+        if not row or row["status"] == "paid":
+            return False
+        await conn.execute(
+            """UPDATE orders SET status = 'paid', charge_id = COALESCE(?, charge_id),
+                                 currency = COALESCE(?, currency), paid_at = ?
+               WHERE id = ?""",
+            (charge_id, currency, datetime.now().isoformat(timespec="seconds"), order_id))
+        items = await (await conn.execute(
+            "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
+            (order_id,))).fetchall()
+        for it in items:
+            if it["product_id"]:
+                await conn.execute(
+                    "UPDATE products SET stock = MAX(stock - ?, 0) WHERE id = ?",
+                    (it["quantity"], it["product_id"]))
+        await conn.execute("DELETE FROM cart_items WHERE user_id = ?", (row["user_id"],))
+    return True
+
+
+async def out_of_stock(items: list[dict]) -> list[dict]:
+    """Позиции корзины, которых не хватает на складе."""
+    problems = []
+    for it in items:
+        product = await get_product(it["product_id"])
+        if not product or not product["is_active"] or product["stock"] < it["quantity"]:
+            problems.append({**it, "available": product["stock"] if product else 0})
+    return problems
 
 
 async def get_order(order_id: int) -> dict | None:
