@@ -5,7 +5,7 @@ from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup,
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import settings
-from utils import PAYMENTS, STATUSES, money
+from utils import MANUAL_STATUSES, PAYMENTS, STATUSES, money
 
 
 def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
@@ -81,7 +81,7 @@ def payment_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=PAYMENTS["cash"], callback_data="pay_cash")
     kb.button(text=PAYMENTS["transfer"], callback_data="pay_transfer")
-    if settings.payment_token:
+    if settings.online_enabled:
         kb.button(text=PAYMENTS["online"], callback_data="pay_online")
     kb.adjust(1)
     return kb.as_markup()
@@ -157,7 +157,7 @@ def admin_orders_kb(orders: list[dict]) -> InlineKeyboardMarkup:
 
 def admin_order_kb(order_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    for code, label in STATUSES.items():
+    for code, label in MANUAL_STATUSES.items():
         kb.button(text=label, callback_data=f"a_status_{order_id}_{code}")
     kb.button(text="⬅️ К заказам", callback_data="a_orders")
     kb.adjust(2, 2, 1, 1)

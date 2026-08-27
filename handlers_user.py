@@ -12,7 +12,7 @@ from aiogram.types import (CallbackQuery, LabeledPrice, Message,
 import database as db
 import keyboards as kb
 from config import settings
-from utils import PAYMENTS, STATUSES, escape, money
+from utils import PAYMENTS, STATUSES, escape, money, stars, to_stars
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -165,6 +165,13 @@ async def cart_edit(callback: CallbackQuery):
     action, pid = callback.data.split("_")
     pid = int(pid)
     if action == "plus":
+        product = await db.get_product(pid)
+        current = next((i["quantity"] for i in await db.get_cart(callback.from_user.id)
+                        if i["product_id"] == pid), 0)
+        if product and current >= product["stock"]:
+            await callback.answer(f"Больше нет в наличии: осталось {product['stock']} шт.",
+                                  show_alert=True)
+            return
         await db.change_qty(callback.from_user.id, pid, +1)
     elif action == "minus":
         await db.change_qty(callback.from_user.id, pid, -1)
@@ -269,6 +276,8 @@ async def checkout_payment(callback: CallbackQuery, state: FSMContext):
             f"📱 {escape(data['phone'])}\n"
             f"🏠 {escape(data['address'])}\n"
             f"💳 {PAYMENTS[method]}")
+    if method == "online" and settings.stars_mode:
+        text += f"\n\n⭐ К оплате: <b>{stars(to_stars(db.cart_total(items)))}</b>"
     if data.get("comment"):
         text += f"\n💬 {escape(data['comment'])}"
 
@@ -293,20 +302,45 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot):
         await callback.answer("Корзина пуста", show_alert=True)
         return
 
-    # Онлайн-оплата: сначала выставляем счёт, заказ создастся после оплаты
-    if data.get("payment") == "online" and settings.payment_token:
-        prices = [LabeledPrice(label=f"{i['title']} ×{i['quantity']}",
-                               amount=int(round(i["price"] * i["quantity"] * 100)))
-                  for i in items]
-        await bot.send_invoice(
-            chat_id=callback.from_user.id,
-            title=f"Заказ в {settings.shop_name}",
-            description=", ".join(i["title"] for i in items)[:255],
-            payload="shop_order",
-            provider_token=settings.payment_token,
-            currency=settings.payment_currency,
-            prices=prices,
-        )
+    # товар мог закончиться, пока покупатель заполнял анкету
+    problems = await db.out_of_stock(items)
+    if problems:
+        lines = "\n".join(f"• {escape(p['title'])}: осталось {p['available']} шт."
+                           for p in problems)
+        await state.clear()
+        await _replace(callback,
+                       f"😔 Пока вы оформляли заказ, наличие изменилось:\n\n{lines}\n\n"
+                       f"Поправьте корзину и попробуйте снова.", kb.cart_kb(items))
+        await callback.answer()
+        return
+
+    # Онлайн-оплата: заказ создаётся со статусом «ожидает оплаты»,
+    # склад и корзина не трогаются, пока Telegram не подтвердит платёж.
+    if data.get("payment") == "online" and settings.online_enabled:
+        order_id = await db.create_order(
+            callback.from_user.id, {**data, "currency": settings.payment_currency}, items,
+            status="pending", commit_stock=False, clear_cart=False)
+        try:
+            await bot.send_invoice(
+                chat_id=callback.from_user.id,
+                title=f"Заказ №{order_id} в {settings.shop_name}"[:32],
+                description=", ".join(i["title"] for i in items)[:255],
+                payload=f"order_{order_id}",
+                provider_token=settings.payment_token or None,
+                currency=settings.payment_currency,
+                prices=invoice_prices(items),
+            )
+        except Exception as e:
+            log.exception("Не удалось выставить счёт по заказу #%s: %s", order_id, e)
+            await db.set_status(order_id, "cancelled")
+            await callback.message.answer(
+                "Не получилось выставить счёт 😔 Попробуйте другой способ оплаты "
+                "или напишите нам.")
+            await state.clear()
+            await callback.answer()
+            return
+        await state.clear()
+        await callback.message.answer("Счёт выставлен — оплатите его в этом чате ⬆️")
         await callback.answer()
         return
 
@@ -322,26 +356,71 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await callback.answer()
 
 
+def invoice_prices(items: list[dict]) -> list[LabeledPrice]:
+    """Позиции счёта.
+
+    Telegram Stars (XTR): ровно одна позиция, сумма — целое число звёзд.
+    Обычная валюта: сумма в минимальных единицах (копейках/центах).
+    """
+    total = db.cart_total(items)
+    if settings.stars_mode:
+        return [LabeledPrice(label=f"Заказ ({len(items)} поз.)", amount=to_stars(total))]
+    return [LabeledPrice(label=f"{i['title']} ×{i['quantity']}"[:32],
+                         amount=int(round(i["price"] * i["quantity"] * 100)))
+            for i in items]
+
+
+def order_id_from_payload(payload: str | None) -> int | None:
+    if payload and payload.startswith("order_") and payload[6:].isdigit():
+        return int(payload[6:])
+    return None
+
+
 # ------------------------------------------------------------- онлайн-оплата
 
 @router.pre_checkout_query()
 async def pre_checkout(query: PreCheckoutQuery, bot: Bot):
+    """Последняя проверка перед списанием денег: заказ есть и ещё не оплачен."""
+    order_id = order_id_from_payload(query.invoice_payload)
+    order = await db.get_order(order_id) if order_id else None
+
+    if order_id and not order:
+        await bot.answer_pre_checkout_query(
+            query.id, ok=False, error_message="Заказ не найден, оформите его заново.")
+        return
+    if order and order["status"] not in {"pending", "new"}:
+        await bot.answer_pre_checkout_query(
+            query.id, ok=False, error_message="Этот заказ уже оплачен или отменён.")
+        return
     await bot.answer_pre_checkout_query(query.id, ok=True)
 
 
 @router.message(F.successful_payment)
 async def on_paid(message: Message, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-    items = await db.get_cart(message.from_user.id)
-    if not items:
-        await message.answer("Оплата получена ✅")
-        return
-    order_id = await db.create_order(message.from_user.id, data or {"payment": "online"}, items)
-    await db.set_status(order_id, "paid")
+    payment = message.successful_payment
+    order_id = order_id_from_payload(payment.invoice_payload)
+
+    if order_id and await db.get_order(order_id):
+        is_new = await db.mark_paid(order_id, payment.telegram_payment_charge_id,
+                                    payment.currency)
+    else:
+        # счёт из старой версии бота: собираем заказ из текущей корзины
+        items = await db.get_cart(message.from_user.id)
+        if not items:
+            await message.answer("Оплата получена ✅")
+            return
+        data = await state.get_data()
+        order_id = await db.create_order(
+            message.from_user.id, {**data, "payment": "online",
+                                   "currency": payment.currency}, items)
+        await db.mark_paid(order_id, payment.telegram_payment_charge_id, payment.currency)
+        is_new = True
+
     await state.clear()
     await message.answer(f"✅ Оплата получена. Заказ <b>#{order_id}</b> оформлен!",
                          reply_markup=kb.main_menu(settings.is_admin(message.from_user.id)))
-    await notify_admins(bot, order_id)
+    if is_new:
+        await notify_admins(bot, order_id)
 
 
 # ---------------------------------------------------------------- мои заказы

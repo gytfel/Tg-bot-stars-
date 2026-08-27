@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, Message
 
 import database as db
 import keyboards as kb
-from config import settings
+from config import STARS_CURRENCY, settings
 from utils import PAYMENTS, STATUSES, escape, money
 
 router = Router()
@@ -80,9 +80,13 @@ async def admin_addcat_save(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Отменено.", reply_markup=kb.main_menu(True))
         return
-    await db.add_category(message.text.strip())
+    title = (message.text or "").strip()
+    if not title:
+        await message.answer("Название нужно прислать текстом.")
+        return
+    await db.add_category(title)
     await state.clear()
-    await message.answer(f"✅ Категория «{escape(message.text.strip())}» добавлена.",
+    await message.answer(f"✅ Категория «{escape(title)}» добавлена.",
                          reply_markup=kb.main_menu(True))
     cats = await db.get_categories(only_active=False)
     await message.answer("📂 <b>Категории</b>", reply_markup=kb.admin_cats_kb(cats))
@@ -124,6 +128,9 @@ async def admin_toggle(callback: CallbackQuery):
     pid = int(callback.data.split("_")[-1])
     await db.toggle_product(pid)
     product = await db.get_product(pid)
+    if not product:
+        await callback.answer("Товар уже удалён", show_alert=True)
+        return
     products = await db.get_products(product["category_id"], only_active=False)
     await callback.message.edit_reply_markup(
         reply_markup=kb.admin_prods_kb(products, product["category_id"]))
@@ -155,14 +162,21 @@ async def addprod_title(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Отменено.", reply_markup=kb.main_menu(True))
         return
-    await state.update_data(title=message.text.strip())
+    title = (message.text or "").strip()
+    if not title:
+        await message.answer("Название нужно прислать текстом.")
+        return
+    await state.update_data(title=title)
     await state.set_state(AddProduct.description)
     await message.answer("2/4 — Описание товара (или «-» чтобы пропустить):")
 
 
 @router.message(AddProduct.description)
 async def addprod_desc(message: Message, state: FSMContext):
-    text = message.text.strip()
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Описание нужно прислать текстом (или «-», чтобы пропустить).")
+        return
     await state.update_data(description="" if text == "-" else text)
     await state.set_state(AddProduct.price)
     await message.answer("3/4 — Цена (только число, например 1990):")
@@ -222,7 +236,11 @@ async def admin_orders(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("a_order_"))
 async def admin_order(callback: CallbackQuery):
-    order = await db.get_order(int(callback.data.split("_")[-1]))
+    await show_order(callback, int(callback.data.split("_")[-1]))
+
+
+async def show_order(callback: CallbackQuery, order_id: int) -> None:
+    order = await db.get_order(order_id)
     if not order:
         await callback.answer("Заказ не найден", show_alert=True)
         return
@@ -237,15 +255,23 @@ async def admin_order(callback: CallbackQuery):
             f"💬 {escape(order['comment']) or '—'}\n"
             f"🆔 <code>{order['user_id']}</code>\n\n"
             f"Статус: <b>{STATUSES.get(order['status'], order['status'])}</b>")
-    await callback.message.edit_text(text, reply_markup=kb.admin_order_kb(order["id"]))
-    await callback.answer()
+    if order["charge_id"]:
+        text += f"\n🧾 Платёж: <code>{order['charge_id']}</code>"
+    try:
+        await callback.message.edit_text(text, reply_markup=kb.admin_order_kb(order["id"]))
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb.admin_order_kb(order["id"]))
 
 
 @router.callback_query(F.data.startswith("a_status_"))
 async def admin_set_status(callback: CallbackQuery, bot: Bot):
-    _, _, order_id, status = callback.data.split("_")
-    await db.set_status(int(order_id), status)
-    order = await db.get_order(int(order_id))
+    _, _, raw_id, status = callback.data.split("_")
+    order_id = int(raw_id)
+    order = await db.get_order(order_id)
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    await db.set_status(order_id, status)
     try:
         await bot.send_message(
             order["user_id"],
@@ -253,7 +279,7 @@ async def admin_set_status(callback: CallbackQuery, bot: Bot):
     except Exception as e:
         log.warning("Не удалось уведомить клиента: %s", e)
     await callback.answer(f"Статус: {STATUSES.get(status, status)}")
-    await admin_order(callback)
+    await show_order(callback, order_id)
 
 
 # ---------------------------------------------------------------- статистика
@@ -293,7 +319,9 @@ async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
     status = await message.answer(f"Отправляю… 0/{len(user_ids)}")
     for idx, uid in enumerate(user_ids, 1):
         try:
-            await bot.send_message(uid, message.html_text)
+            # copy_message переносит любой контент: текст, фото, видео, подпись
+            await bot.copy_message(chat_id=uid, from_chat_id=message.chat.id,
+                                   message_id=message.message_id)
             sent += 1
         except Exception:
             failed += 1
@@ -305,3 +333,42 @@ async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
                 pass
     await status.edit_text(f"📣 Рассылка завершена.\n✅ Доставлено: {sent}\n❌ Ошибок: {failed}")
     await message.answer("⚙️ <b>Админ-панель</b>", reply_markup=kb.admin_menu())
+
+
+# ---------------------------------------------------------------- возвраты
+
+@router.message(Command("refund"))
+async def admin_refund(message: Message, bot: Bot):
+    """/refund <номер заказа> — вернуть оплату Telegram Stars покупателю."""
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].lstrip("#").isdigit():
+        await message.answer("Формат: <code>/refund 42</code> — где 42 это номер заказа.")
+        return
+
+    order = await db.get_order(int(parts[1].lstrip("#")))
+    if not order:
+        await message.answer("Заказ не найден.")
+        return
+    if not order["charge_id"]:
+        await message.answer("По этому заказу нет онлайн-платежа — возврат делается вручную.")
+        return
+    if order["currency"] != STARS_CURRENCY:
+        await message.answer("Автовозврат доступен только для Telegram Stars. "
+                             "Платежи через провайдера возвращайте в его личном кабинете.")
+        return
+
+    try:
+        await bot.refund_star_payment(user_id=order["user_id"],
+                                      telegram_payment_charge_id=order["charge_id"])
+    except Exception as e:
+        log.warning("Возврат по заказу #%s не прошёл: %s", order["id"], e)
+        await message.answer(f"Возврат не прошёл: {escape(str(e))}")
+        return
+
+    await db.set_status(order["id"], "cancelled")
+    await message.answer(f"✅ Звёзды по заказу #{order['id']} возвращены покупателю.")
+    try:
+        await bot.send_message(order["user_id"],
+                               f"Оплата по заказу #{order['id']} возвращена ⭐")
+    except Exception as e:
+        log.warning("Не удалось уведомить клиента о возврате: %s", e)
