@@ -6,6 +6,13 @@ import database as db
 from conftest import ADMIN_ID, USER_ID, callback_update, text_update
 
 
+@pytest.fixture(autouse=True)
+def physical_mode(monkeypatch):
+    """Эти сценарии описывают магазин физических товаров (анкета с адресом)."""
+    from config import settings
+    monkeypatch.setattr(settings, "shop_mode", "physical")
+
+
 @pytest.fixture
 async def catalog(db_file):
     cat_id = await db.add_category("☕ Кофе")

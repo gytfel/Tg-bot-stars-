@@ -12,7 +12,7 @@ from aiogram.types import CallbackQuery, Message
 import database as db
 import keyboards as kb
 from config import STARS_CURRENCY, settings
-from utils import PAYMENTS, STATUSES, escape, money
+from utils import PAYMENTS, STATUSES, escape, money, stars, to_stars
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ class AddProduct(StatesGroup):
     description = State()
     price = State()
     photo = State()
+    content = State()   # что выдать после оплаты (цифровой товар)
 
 
 class Broadcast(StatesGroup):
@@ -152,7 +153,8 @@ async def admin_delprod(callback: CallbackQuery):
 async def admin_addprod(callback: CallbackQuery, state: FSMContext):
     await state.update_data(category_id=int(callback.data.split("_")[-1]))
     await state.set_state(AddProduct.title)
-    await callback.message.answer("1/4 — Название товара:", reply_markup=kb.cancel_kb())
+    await callback.message.answer(f"1/{_steps()} — Название товара:",
+                                  reply_markup=kb.cancel_kb())
     await callback.answer()
 
 
@@ -168,7 +170,7 @@ async def addprod_title(message: Message, state: FSMContext):
         return
     await state.update_data(title=title)
     await state.set_state(AddProduct.description)
-    await message.answer("2/4 — Описание товара (или «-» чтобы пропустить):")
+    await message.answer(f"2/{_steps()} — Описание товара (или «-» чтобы пропустить):")
 
 
 @router.message(AddProduct.description)
@@ -179,7 +181,8 @@ async def addprod_desc(message: Message, state: FSMContext):
         return
     await state.update_data(description="" if text == "-" else text)
     await state.set_state(AddProduct.price)
-    await message.answer("3/4 — Цена (только число, например 1990):")
+    hint = f" в {settings.currency}" if not settings.stars_mode else ""
+    await message.answer(f"3/{_steps()} — Цена{hint} (только число, например 1990):")
 
 
 @router.message(AddProduct.price)
@@ -194,12 +197,12 @@ async def addprod_price(message: Message, state: FSMContext):
         return
     await state.update_data(price=price)
     await state.set_state(AddProduct.photo)
-    await message.answer("4/4 — Отправьте фото товара (или «-» чтобы пропустить):")
+    await message.answer(f"4/{_steps()} — Отправьте фото товара (или «-» чтобы пропустить):")
 
 
 @router.message(AddProduct.photo, F.photo)
 async def addprod_photo(message: Message, state: FSMContext):
-    await _save_product(message, state, message.photo[-1].file_id)
+    await _after_photo(message, state, message.photo[-1].file_id)
 
 
 @router.message(AddProduct.photo)
@@ -207,16 +210,54 @@ async def addprod_nophoto(message: Message, state: FSMContext):
     if (message.text or "").strip() != "-":
         await message.answer("Отправьте фото или напишите «-».")
         return
-    await _save_product(message, state, None)
+    await _after_photo(message, state, None)
 
 
-async def _save_product(message: Message, state: FSMContext, photo_id: str | None):
+async def _after_photo(message: Message, state: FSMContext, photo_id: str | None):
+    await state.update_data(photo_id=photo_id)
+    if not settings.digital:
+        await _save_product(message, state)
+        return
+    await state.set_state(AddProduct.content)
+    await message.answer(
+        f"5/{_steps()} — Что выдать покупателю после оплаты?\n\n"
+        "Пришлите ссылку, ключ или инструкцию текстом — либо отправьте файл.\n"
+        "«-» — заполнить позже (тогда доступ придётся высылать вручную).")
+
+
+@router.message(AddProduct.content, F.document)
+async def addprod_content_file(message: Message, state: FSMContext):
+    await _save_product(message, state, content=message.caption,
+                        content_file_id=message.document.file_id)
+
+
+@router.message(AddProduct.content)
+async def addprod_content_text(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Пришлите текст, файл или «-».")
+        return
+    await _save_product(message, state, content=None if text == "-" else text)
+
+
+def _steps() -> int:
+    return 5 if settings.digital else 4
+
+
+async def _save_product(message: Message, state: FSMContext, content: str | None = None,
+                        content_file_id: str | None = None):
     data = await state.get_data()
     await db.add_product(data["category_id"], data["title"], data["description"],
-                         data["price"], photo_id)
+                         data["price"], data.get("photo_id"),
+                         content=content, content_file_id=content_file_id)
     await state.clear()
-    await message.answer(f"✅ Товар «{escape(data['title'])}» добавлен "
-                         f"за {money(data['price'])}.", reply_markup=kb.main_menu(True))
+
+    price = f"{stars(to_stars(data['price']))}" if settings.stars_mode else money(data["price"])
+    text = f"✅ Товар «{escape(data['title'])}» добавлен за {price}."
+    if settings.digital and not (content or content_file_id):
+        text += ("\n\n⚠️ Не указано, что выдавать после оплаты. Заполните позже: "
+                 "<code>python manage.py product content ID «текст»</code>")
+    await message.answer(text, reply_markup=kb.main_menu(True))
     await message.answer("⚙️ <b>Админ-панель</b>", reply_markup=kb.admin_menu())
 
 
@@ -278,6 +319,12 @@ async def admin_set_status(callback: CallbackQuery, bot: Bot):
             f"Статус вашего заказа #{order_id}: <b>{STATUSES.get(status, status)}</b>")
     except Exception as e:
         log.warning("Не удалось уведомить клиента: %s", e)
+    # оплату перевода админ подтверждает руками — значит пора выдать доступ
+    if status == "paid" and settings.digital:
+        from handlers_user import deliver_order
+        if await deliver_order(bot, order_id):
+            await callback.message.answer(f"🎁 Доступ по заказу #{order_id} отправлен покупателю.")
+
     await callback.answer(f"Статус: {STATUSES.get(status, status)}")
     await show_order(callback, order_id)
 

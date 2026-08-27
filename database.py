@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS products (
     price       REAL NOT NULL,
     photo_id    TEXT,
     stock       INTEGER NOT NULL DEFAULT 999,
-    is_active   INTEGER NOT NULL DEFAULT 1
+    is_active   INTEGER NOT NULL DEFAULT 1,
+    content     TEXT,
+    content_file_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS cart_items (
@@ -63,7 +65,9 @@ CREATE TABLE IF NOT EXISTS order_items (
     product_id INTEGER,
     title      TEXT NOT NULL,
     price      REAL NOT NULL,
-    quantity   INTEGER NOT NULL
+    quantity   INTEGER NOT NULL,
+    content    TEXT,
+    content_file_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_user   ON orders(user_id);
@@ -78,6 +82,15 @@ MIGRATIONS = {
         "currency": "ALTER TABLE orders ADD COLUMN currency TEXT",
         "charge_id": "ALTER TABLE orders ADD COLUMN charge_id TEXT",
         "paid_at": "ALTER TABLE orders ADD COLUMN paid_at TEXT",
+        "delivered_at": "ALTER TABLE orders ADD COLUMN delivered_at TEXT",
+    },
+    "products": {
+        "content": "ALTER TABLE products ADD COLUMN content TEXT",
+        "content_file_id": "ALTER TABLE products ADD COLUMN content_file_id TEXT",
+    },
+    "order_items": {
+        "content": "ALTER TABLE order_items ADD COLUMN content TEXT",
+        "content_file_id": "ALTER TABLE order_items ADD COLUMN content_file_id TEXT",
     },
 }
 
@@ -177,14 +190,27 @@ async def get_product(product_id: int) -> dict | None:
 
 
 async def add_product(category_id: int, title: str, description: str,
-                      price: float, photo_id: str | None, stock: int = 999) -> int:
+                      price: float, photo_id: str | None, stock: int = 999,
+                      content: str | None = None,
+                      content_file_id: str | None = None) -> int:
+    """content / content_file_id — что выдать покупателю после оплаты (цифровой товар)."""
     async with db() as conn:
         cur = await conn.execute(
-            """INSERT INTO products (category_id, title, description, price, photo_id, stock)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (category_id, title, description, price, photo_id, stock),
+            """INSERT INTO products (category_id, title, description, price, photo_id,
+                                     stock, content, content_file_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (category_id, title, description, price, photo_id, stock,
+             content, content_file_id),
         )
         return cur.lastrowid
+
+
+async def set_product_content(product_id: int, content: str | None,
+                              content_file_id: str | None = None) -> None:
+    async with db() as conn:
+        await conn.execute(
+            "UPDATE products SET content = ?, content_file_id = ? WHERE id = ?",
+            (content, content_file_id, product_id))
 
 
 async def toggle_product(product_id: int) -> None:
@@ -235,7 +261,8 @@ async def clear_cart(user_id: int) -> None:
 async def get_cart(user_id: int) -> list[dict]:
     async with db() as conn:
         rows = await (await conn.execute(
-            """SELECT c.product_id, c.quantity, p.title, p.price, p.stock
+            """SELECT c.product_id, c.quantity, p.title, p.price, p.stock,
+                      p.content, p.content_file_id
                FROM cart_items c JOIN products p ON p.id = c.product_id
                WHERE c.user_id = ? ORDER BY c.id""",
             (user_id,))).fetchall()
@@ -270,9 +297,11 @@ async def create_order(user_id: int, data: dict, items: list[dict],
         order_id = cur.lastrowid
         for it in items:
             await conn.execute(
-                """INSERT INTO order_items (order_id, product_id, title, price, quantity)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (order_id, it["product_id"], it["title"], it["price"], it["quantity"]),
+                """INSERT INTO order_items (order_id, product_id, title, price, quantity,
+                                            content, content_file_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (order_id, it["product_id"], it["title"], it["price"], it["quantity"],
+                 it.get("content"), it.get("content_file_id")),
             )
             if commit_stock:
                 await conn.execute(
@@ -309,6 +338,19 @@ async def mark_paid(order_id: int, charge_id: str | None = None,
                     "UPDATE products SET stock = MAX(stock - ?, 0) WHERE id = ?",
                     (it["quantity"], it["product_id"]))
         await conn.execute("DELETE FROM cart_items WHERE user_id = ?", (row["user_id"],))
+    return True
+
+
+async def mark_delivered(order_id: int) -> bool:
+    """Отметить, что цифровой товар выдан. Идемпотентно."""
+    async with db() as conn:
+        row = await (await conn.execute(
+            "SELECT delivered_at FROM orders WHERE id = ?", (order_id,))).fetchone()
+        if not row or row["delivered_at"]:
+            return False
+        await conn.execute(
+            "UPDATE orders SET delivered_at = ?, status = 'done' WHERE id = ?",
+            (datetime.now().isoformat(timespec="seconds"), order_id))
     return True
 
 

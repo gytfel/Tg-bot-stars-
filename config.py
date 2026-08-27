@@ -38,10 +38,13 @@ class Settings:
     db_path: str = os.getenv("DB_PATH", "shop.db")
     support: str = os.getenv("SUPPORT_CONTACT", "")
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
+    # digital  — цифровой товар: без адреса доставки, выдача сразу после оплаты
+    # physical — физический: анкета с телефоном и адресом, оплата при получении
+    shop_mode: str = os.getenv("SHOP_MODE", "digital").lower()
 
     # --- оплата -------------------------------------------------------------
     payment_token: str = os.getenv("PAYMENT_PROVIDER_TOKEN", "")
-    payment_currency: str = os.getenv("PAYMENT_CURRENCY_CODE", "RUB").upper()
+    payment_currency: str = os.getenv("PAYMENT_CURRENCY_CODE", "XTR").upper()
     # сколько единиц валюты магазина стоит одна ⭐ (для режима Telegram Stars)
     stars_rate: float = _float("STARS_RATE", 2.0)
 
@@ -61,6 +64,10 @@ class Settings:
         return user_id in self.admin_ids
 
     # --- производные значения ----------------------------------------------
+
+    @property
+    def digital(self) -> bool:
+        return self.shop_mode == "digital"
 
     @property
     def stars_mode(self) -> bool:
@@ -87,6 +94,14 @@ class Settings:
             problems.append("BOT_TOKEN выглядит некорректно (нет двоеточия)")
         if not self.admin_ids:
             problems.append("ADMIN_IDS пуст — админ-панель будет недоступна")
+        if self.shop_mode not in {"digital", "physical"}:
+            problems.append(f"SHOP_MODE={self.shop_mode!r}: допустимо digital или physical")
+        if self.digital and self.payment_currency != STARS_CURRENCY and not self.payment_token:
+            problems.append("Цифровой магазин без онлайн-оплаты: включите Telegram Stars "
+                            "(PAYMENT_CURRENCY_CODE=XTR) или укажите токен провайдера")
+        if not self.digital and self.stars_mode:
+            problems.append("Telegram Stars нельзя использовать для физических товаров — "
+                            "подключите платёжного провайдера")
         if self.mode not in {"polling", "webhook"}:
             problems.append(f"BOT_MODE={self.mode!r}: допустимо polling или webhook")
         if self.mode == "webhook":

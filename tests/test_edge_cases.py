@@ -9,6 +9,13 @@ from conftest import ADMIN_ID, USER_ID, callback_update, payment_update, text_up
 PHOTO = [PhotoSize(file_id="photo_1", file_unique_id="u1", width=100, height=100)]
 
 
+@pytest.fixture(autouse=True)
+def physical_mode(monkeypatch):
+    """Эти сценарии описывают магазин физических товаров (анкета с адресом)."""
+    from config import settings
+    monkeypatch.setattr(settings, "shop_mode", "physical")
+
+
 @pytest.fixture
 async def catalog(db_file):
     cat_id = await db.add_category("☕ Кофе")
@@ -51,6 +58,7 @@ async def test_empty_catalog_does_not_break_cart_refresh(dp, bot, session, db_fi
 async def test_online_payment_invoice_amount(dp, bot, session, catalog, monkeypatch):
     from config import settings
     monkeypatch.setattr(settings, "payment_token", "test:provider:token")
+    monkeypatch.setattr(settings, "payment_currency", "RUB")
 
     await dp.feed_update(bot, callback_update(f"add_{catalog['p1']}"))
     await dp.feed_update(bot, callback_update("checkout"))
@@ -78,6 +86,7 @@ async def test_online_payment_invoice_amount(dp, bot, session, catalog, monkeypa
 async def test_successful_payment_creates_paid_order(dp, bot, session, catalog, monkeypatch):
     from config import settings
     monkeypatch.setattr(settings, "payment_token", "test:provider:token")
+    monkeypatch.setattr(settings, "payment_currency", "RUB")
 
     await dp.feed_update(bot, callback_update(f"add_{catalog['p1']}"))
     await dp.feed_update(bot, callback_update("checkout"))

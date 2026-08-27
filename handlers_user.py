@@ -193,6 +193,18 @@ async def noop(callback: CallbackQuery):
     await callback.answer()
 
 
+def _contacts_block(data: dict) -> str:
+    """Контакты в сводке: у цифрового заказа их может не быть вовсе."""
+    rows = []
+    if data.get("name"):
+        rows.append(f"👤 {escape(data['name'])}")
+    if data.get("phone"):
+        rows.append(f"📱 {escape(data['phone'])}")
+    if data.get("address"):
+        rows.append(f"🏠 {escape(data['address'])}")
+    return "".join(f"{row}\n" for row in rows)
+
+
 # ---------------------------------------------------------- оформление заказа
 
 @router.callback_query(F.data == "checkout")
@@ -201,6 +213,16 @@ async def checkout_start(callback: CallbackQuery, state: FSMContext):
     if not items:
         await callback.answer("Корзина пуста", show_alert=True)
         return
+
+    # Цифровой товар: ни адреса, ни телефона — сразу к оплате.
+    # Имя берём из профиля Telegram, связь — через тот же чат.
+    if settings.digital:
+        await state.update_data(name=callback.from_user.full_name)
+        await state.set_state(Checkout.payment)
+        await callback.message.answer("💳 Способ оплаты:", reply_markup=kb.payment_kb())
+        await callback.answer()
+        return
+
     await state.set_state(Checkout.name)
     await callback.message.answer("👤 Как вас зовут? (имя и фамилия)",
                                   reply_markup=kb.cancel_kb())
@@ -272,9 +294,7 @@ async def checkout_payment(callback: CallbackQuery, state: FSMContext):
         for i in items)
     text = (f"<b>Проверьте заказ</b>\n\n{summary}\n\n"
             f"<b>Итого: {money(db.cart_total(items))}</b>\n\n"
-            f"👤 {escape(data['name'])}\n"
-            f"📱 {escape(data['phone'])}\n"
-            f"🏠 {escape(data['address'])}\n"
+            f"{_contacts_block(data)}"
             f"💳 {PAYMENTS[method]}")
     if method == "online" and settings.stars_mode:
         text += f"\n\n⭐ К оплате: <b>{stars(to_stars(db.cart_total(items)))}</b>"
@@ -346,10 +366,12 @@ async def order_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
     order_id = await db.create_order(callback.from_user.id, data, items)
     await state.clear()
+    tail = ("Пришлём доступ в этот чат сразу после подтверждения оплаты."
+            if settings.digital else
+            "Мы свяжемся с вами по указанному номеру.")
     await _replace(callback,
                    f"✅ Заказ <b>#{order_id}</b> принят!\n\n"
-                   f"Сумма: <b>{money(db.cart_total(items))}</b>\n"
-                   f"Мы свяжемся с вами по указанному номеру.", None)
+                   f"Сумма: <b>{money(db.cart_total(items))}</b>\n{tail}", None)
     await callback.message.answer("Что дальше?",
                                   reply_markup=kb.main_menu(settings.is_admin(callback.from_user.id)))
     await notify_admins(bot, order_id)
@@ -421,6 +443,8 @@ async def on_paid(message: Message, state: FSMContext, bot: Bot):
                          reply_markup=kb.main_menu(settings.is_admin(message.from_user.id)))
     if is_new:
         await notify_admins(bot, order_id)
+    if settings.digital:
+        await deliver_order(bot, order_id)
 
 
 # ---------------------------------------------------------------- мои заказы
@@ -439,6 +463,68 @@ async def my_orders(message: Message):
     await message.answer("\n".join(lines))
 
 
+# ------------------------------------------------------- выдача цифрового товара
+
+async def deliver_order(bot: Bot, order_id: int) -> bool:
+    """Отправить покупателю то, что он купил. Идемпотентно: второй раз не шлём.
+
+    Содержимое берётся из снимка в позиции заказа, поэтому выдача работает
+    даже если товар потом удалили из каталога.
+    """
+    order = await db.get_order(order_id)
+    if not order or order["delivered_at"]:
+        return False
+
+    missing = [i["title"] for i in order["items"]
+               if not i["content"] and not i["content_file_id"]]
+    if missing:
+        log.warning("Нечего выдать по заказу #%s: %s", order_id, ", ".join(missing))
+        await _tell(bot, order["user_id"],
+                    f"Заказ <b>#{order_id}</b> оплачен ✅\n"
+                    f"Доступ вышлет менеджер — уже занимаемся.")
+        for admin_id in settings.admin_ids:
+            await _tell(bot, admin_id,
+                        f"⚠️ Заказ #{order_id} оплачен, но у товаров не заполнено, "
+                        f"что выдавать: {escape(', '.join(missing))}")
+        return False
+
+    lines = [f"🎁 <b>Заказ #{order_id}</b> — ваш доступ:"]
+    for item in order["items"]:
+        if item["content"]:
+            lines.append(f"\n<b>{escape(item['title'])}</b>\n{escape(item['content'])}")
+
+    if not await _tell(bot, order["user_id"], "\n".join(lines)):
+        # покупатель заблокировал бота или чат недоступен: не помечаем выданным,
+        # чтобы можно было повторить — python manage.py deliver <номер>
+        for admin_id in settings.admin_ids:
+            await _tell(bot, admin_id,
+                        f"⚠️ Заказ #{order_id} оплачен, но доступ не доставлен "
+                        f"покупателю {order['user_id']}. Повторить: "
+                        f"<code>python manage.py deliver {order_id}</code>")
+        return False
+
+    for item in order["items"]:
+        if item["content_file_id"]:
+            try:
+                await bot.send_document(order["user_id"], item["content_file_id"],
+                                        caption=escape(item["title"]))
+            except Exception as e:  # noqa: BLE001
+                log.warning("Файл по заказу #%s не ушёл: %s", order_id, e)
+
+    await db.mark_delivered(order_id)
+    log.info("Заказ #%s выдан покупателю %s", order_id, order["user_id"])
+    return True
+
+
+async def _tell(bot: Bot, chat_id: int, text: str) -> bool:
+    try:
+        await bot.send_message(chat_id, text)
+        return True
+    except Exception as e:  # noqa: BLE001 — пользователь заблокировал бота и т.п.
+        log.warning("Не удалось написать %s: %s", chat_id, e)
+        return False
+
+
 # ------------------------------------------------------------------ утилиты
 
 async def notify_admins(bot: Bot, order_id: int) -> None:
@@ -449,12 +535,11 @@ async def notify_admins(bot: Bot, order_id: int) -> None:
                       f"{money(i['price'] * i['quantity'])}" for i in order["items"])
     text = (f"🔔 <b>Новый заказ #{order['id']}</b>\n\n{items}\n\n"
             f"<b>Итого: {money(order['total'])}</b>\n\n"
-            f"👤 {escape(order['name'])}\n"
-            f"📱 {escape(order['phone'])}\n"
-            f"🏠 {escape(order['address'])}\n"
+            f"{_contacts_block(order)}"
             f"💳 {PAYMENTS.get(order['payment_method'], '—')}\n"
-            f"💬 {escape(order['comment']) or '—'}\n"
             f"🆔 Клиент: <code>{order['user_id']}</code>")
+    if order["comment"]:
+        text += f"\n💬 {escape(order['comment'])}"
     for admin_id in settings.admin_ids:
         try:
             await bot.send_message(admin_id, text)

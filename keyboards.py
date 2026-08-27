@@ -79,10 +79,12 @@ def cart_kb(items: list[dict]) -> InlineKeyboardMarkup:
 
 def payment_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text=PAYMENTS["cash"], callback_data="pay_cash")
-    kb.button(text=PAYMENTS["transfer"], callback_data="pay_transfer")
     if settings.online_enabled:
         kb.button(text=PAYMENTS["online"], callback_data="pay_online")
+    # «при получении» бессмысленно для цифрового товара — получения нет
+    if not settings.digital:
+        kb.button(text=PAYMENTS["cash"], callback_data="pay_cash")
+    kb.button(text=PAYMENTS["transfer"], callback_data="pay_transfer")
     kb.adjust(1)
     return kb.as_markup()
 

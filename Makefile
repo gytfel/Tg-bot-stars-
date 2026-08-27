@@ -1,4 +1,4 @@
-.PHONY: install run check test seed docker-up docker-logs deploy
+.PHONY: install run check status test seed docker-up docker-logs deploy
 
 install:            ## зависимости в venv
 	python3 -m venv venv && venv/bin/pip install -r requirements-dev.txt
@@ -7,7 +7,10 @@ run:                ## запустить бота локально
 	python bot.py
 
 check:              ## самодиагностика (.env, база, связь с Telegram)
-	python doctor.py
+	python manage.py check
+
+status:             ## что с ботом, сервисом и базой
+	python manage.py status
 
 test:               ## прогнать тесты
 	python -m pytest -q

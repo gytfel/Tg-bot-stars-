@@ -1,15 +1,21 @@
 # 🛍 Telegram-бот для продаж
 
-Магазин внутри Telegram: каталог → корзина → оформление заказа → уведомление админу.
+Магазин внутри Telegram: каталог → корзина → оплата → выдача товара.
 Написан на **aiogram 3** + SQLite, без внешних сервисов.
+
+По умолчанию бот настроен на **цифровой товар** (`SHOP_MODE=digital`): доступы,
+файлы, консультации, подписки. Оплата — ⭐ Telegram Stars, доступ уходит покупателю
+автоматически сразу после платежа. Для физических товаров есть режим
+`SHOP_MODE=physical`: анкета с телефоном и адресом, оплата при получении.
 
 ## Возможности
 
 **Для покупателя**
 - Каталог с категориями, фото, описанием и ценой
 - Корзина: добавить, изменить количество, удалить, очистить
-- Оформление заказа: имя, телефон (кнопкой «поделиться контактом»), адрес, комментарий
-- Оплата: при получении / переводом / онлайн — картой через провайдера или ⭐ Telegram Stars
+- Цифровой товар: оформление в два тапа — корзина, оплата, доступ в чат
+- Физический товар: анкета с именем, телефоном (кнопкой «поделиться контактом») и адресом
+- Оплата: ⭐ Telegram Stars, карта через провайдера, перевод, при получении
 - История своих заказов и уведомления о смене статуса
 
 **Для админа**
@@ -19,6 +25,7 @@
 - Статистика: пользователи, заказы, оборот
 - Рассылка по всем пользователям бота (текст, фото, видео)
 - Возврат оплаты звёздами: `/refund <номер заказа>`
+- Управление с сервера через терминал: `python manage.py ...` (см. ниже)
 
 ## Быстрый старт
 
@@ -37,12 +44,30 @@ cp env.example .env             # Windows: copy env.example .env
 - `ADMIN_IDS` — ваш ID, узнать у [@userinfobot](https://t.me/userinfobot)
 
 ```bash
-python seed.py        # (по желанию) демо-каталог
-python doctor.py      # проверка: .env, база, связь с Telegram, оплата
-python bot.py         # запуск
+python seed.py                 # (по желанию) демо-каталог
+python manage.py check         # проверка: .env, база, связь с Telegram, оплата
+python manage.py run           # запуск (то же самое, что python bot.py)
 ```
 
 Откройте бота в Telegram и нажмите **Start**.
+
+## Цифровой товар: что бот выдаёт после оплаты
+
+У каждого товара есть поле «что выдать после оплаты» — ссылка, ключ, инструкция
+или файл. Заполняется при добавлении товара в админ-панели (шаг 5 из 5) либо из
+терминала:
+
+```bash
+python manage.py product content 3 "https://example.com/course · код PY-2026"
+```
+
+Как это работает: покупатель оплачивает → Telegram подтверждает платёж → бот
+отправляет содержимое в чат и переводит заказ в «✅ Выполнен». Содержимое
+сохраняется в самом заказе, поэтому выдача работает даже если товар потом удалили
+из каталога. Если покупатель заблокировал бота, заказ **не** помечается выданным —
+повторить можно командой `python manage.py deliver <номер>`. Если у товара не
+заполнено, что выдавать, покупатель получит «доступ вышлет менеджер», а админ —
+предупреждение.
 
 ## Развёртывание на сервере
 
@@ -102,28 +127,85 @@ PORT=8080
 ### Проверка и обслуживание
 
 ```bash
+python manage.py status      # что с ботом, сервисом и базой прямо сейчас
 python doctor.py             # полная диагностика, включая getMe и webhook
 python doctor.py --offline   # без обращения к Telegram
 python doctor.py --health    # короткая проверка для мониторинга (код возврата)
-python -m pytest -q          # тесты (49 шт., без сети и без токена)
+python -m pytest -q          # тесты (83 шт., без сети и без токена)
 
-bash deploy/backup.sh        # бэкап базы; в cron: 0 4 * * * /opt/shopbot/deploy/backup.sh
+python manage.py backup      # копия базы; в cron: 0 4 * * * /opt/shopbot/deploy/backup.sh
 ```
 
 Если сервер ходит в интернет только через прокси — `TELEGRAM_PROXY` в `.env`
 (и `pip install aiohttp-socks`).
 
+## Управление из терминала
+
+Всё, что можно сделать в админ-панели бота, доступно и с сервера — по SSH,
+без Telegram. `python manage.py` без аргументов покажет список команд.
+
+```bash
+# бот и сервис
+python manage.py status                  # режим, оплата, состояние сервиса, сводка по базе
+python manage.py check                   # полная диагностика (включая связь с Telegram)
+python manage.py start | stop | restart  # systemd или docker — определяется автоматически
+python manage.py logs -f                 # логи сервиса
+python manage.py run                     # запустить бота прямо в этом терминале
+
+# каталог
+python manage.py catalog                 # дерево категорий и товаров
+python manage.py category add "📚 Курсы"
+python manage.py product add --cat 1 --title "Python с нуля" --price 2900 \
+                             --desc "12 уроков" --content "https://example.com/py"
+python manage.py product content 3 "https://example.com/course"
+python manage.py product show 3
+python manage.py product toggle 3        # скрыть или вернуть в каталог
+python manage.py product rm 3
+
+# заказы и покупатели
+python manage.py orders --status new
+python manage.py order show 12
+python manage.py order status 12 paid    # сменит статус, уведомит клиента и выдаст товар
+python manage.py deliver 12              # повторная выдача доступа
+python manage.py refund 12               # возврат звёзд
+python manage.py users
+python manage.py stats                   # продажи, статусы, топ товаров
+
+# прочее
+python manage.py broadcast "Новый курс уже в каталоге" --dry-run
+python manage.py backup --dir /var/backups/shopbot
+```
+
+Команды, которые пишут покупателям (`broadcast`, `deliver`, `refund`,
+`order status`), обращаются к Telegram — им нужен рабочий `BOT_TOKEN`.
+Остальные работают с базой напрямую и не требуют сети.
+
+В Docker те же команды выполняются внутри контейнера:
+
+```bash
+docker compose exec bot python manage.py stats
+```
+
+Через systemd — от пользователя бота, чтобы не сломать права на базу:
+
+```bash
+sudo -u shopbot /opt/shopbot/venv/bin/python /opt/shopbot/manage.py orders
+```
+
 ## Оплата
 
-Всегда доступны оплата при получении и перевод на карту. Онлайн-оплата
-включается одной настройкой:
+По умолчанию включены Telegram Stars — для цифровых товаров ничего подключать не
+нужно:
 
 ```env
-# Telegram Stars — ничего подключать не нужно (цифровые товары и услуги)
 PAYMENT_CURRENCY_CODE=XTR
 STARS_RATE=2.0                  # сколько рублей прайса в одной ⭐
+```
 
-# ...или карты через провайдера (@BotFather → Payments), для физических товаров
+Для физических товаров звёзды использовать нельзя — нужен провайдер:
+
+```env
+SHOP_MODE=physical
 PAYMENT_CURRENCY_CODE=RUB
 PAYMENT_PROVIDER_TOKEN=390540012:TEST:xxxxxxxx
 ```
@@ -147,6 +229,7 @@ Telegram не подтвердит платёж. Возврат звёзд — `
 | `handlers_admin.py` | админ-панель, рассылка, возвраты |
 | `utils.py` | форматирование, статусы, пересчёт в звёзды |
 | `doctor.py` | самодиагностика перед запуском |
+| `manage.py` | управление магазином из терминала |
 | `seed.py` | демо-данные |
 | `deploy/` | systemd-юнит, nginx, установка, бэкап |
 | `tests/` | тесты сценариев на поддельной Telegram-сессии |
