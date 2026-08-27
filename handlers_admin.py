@@ -181,7 +181,7 @@ async def addprod_desc(message: Message, state: FSMContext):
         return
     await state.update_data(description="" if text == "-" else text)
     await state.set_state(AddProduct.price)
-    hint = f" в {settings.currency}" if not settings.stars_mode else ""
+    hint = f" в {settings.currency}" if not settings.pay_in_stars else ""
     await message.answer(f"3/{_steps()} — Цена{hint} (только число, например 1990):")
 
 
@@ -252,7 +252,7 @@ async def _save_product(message: Message, state: FSMContext, content: str | None
                          content=content, content_file_id=content_file_id)
     await state.clear()
 
-    price = f"{stars(to_stars(data['price']))}" if settings.stars_mode else money(data["price"])
+    price = f"{stars(to_stars(data['price']))}" if settings.pay_in_stars else money(data["price"])
     text = f"✅ Товар «{escape(data['title'])}» добавлен за {price}."
     if settings.digital and not (content or content_file_id):
         text += ("\n\n⚠️ Не указано, что выдавать после оплаты. Заполните позже: "
@@ -380,6 +380,50 @@ async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
                 pass
     await status.edit_text(f"📣 Рассылка завершена.\n✅ Доставлено: {sent}\n❌ Ошибок: {failed}")
     await message.answer("⚙️ <b>Админ-панель</b>", reply_markup=kb.admin_menu())
+
+
+# ------------------------------------------------------------- заказы звёзд
+
+@router.callback_query(F.data.startswith("a_stdone_"))
+async def admin_stars_done(callback: CallbackQuery, bot: Bot):
+    """Админ купил звёзды руками и подтверждает выдачу."""
+    import stars
+
+    order_id = int(callback.data.rsplit("_", 1)[1])
+    if await stars.deliver_manually(bot, order_id):
+        await callback.message.edit_text(
+            f"✅ Заказ #{order_id} закрыт: звёзды зачислены вручную.")
+        await callback.answer("Готово")
+    else:
+        await callback.answer("Заказ уже закрыт или не найден", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("a_stretry_"))
+async def admin_stars_retry(callback: CallbackQuery, bot: Bot):
+    """Повторить автозакупку через Fragment."""
+    import stars
+
+    order_id = int(callback.data.rsplit("_", 1)[1])
+    await callback.answer("Пробую ещё раз…")
+    result = await stars.fulfil(bot, order_id)
+    if not result.ok:
+        await callback.message.answer(f"Заказ #{order_id}: {escape(str(result))}")
+
+
+@router.message(Command("stars"))
+async def admin_stars_pending(message: Message):
+    """Список оплаченных, но не выданных заказов на звёзды."""
+    waiting = await db.undelivered_star_orders()
+    if not waiting:
+        await message.answer("Невыданных заказов на звёзды нет ✅")
+        return
+    lines = ["<b>⏳ Ждут выдачи</b>\n"]
+    for order in waiting:
+        lines.append(f"#{order['id']} — {order['stars_qty']} ⭐ на "
+                     f"@{escape(order['recipient'] or '—')} — {money(order['total'])}"
+                     + (f"\n   ⚠️ {escape(order['fragment_error'])}"
+                        if order["fragment_error"] else ""))
+    await message.answer("\n".join(lines))
 
 
 # ---------------------------------------------------------------- возвраты

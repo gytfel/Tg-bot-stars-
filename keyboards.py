@@ -9,10 +9,16 @@ from utils import MANUAL_STATUSES, PAYMENTS, STATUSES, money
 
 
 def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(text="🛍 Каталог"), KeyboardButton(text="🛒 Корзина")],
-        [KeyboardButton(text="📦 Мои заказы"), KeyboardButton(text="ℹ️ О магазине")],
-    ]
+    if settings.stars_shop:
+        rows = [
+            [KeyboardButton(text="⭐ Купить звёзды")],
+            [KeyboardButton(text="📦 Мои заказы"), KeyboardButton(text="ℹ️ О магазине")],
+        ]
+    else:
+        rows = [
+            [KeyboardButton(text="🛍 Каталог"), KeyboardButton(text="🛒 Корзина")],
+            [KeyboardButton(text="📦 Мои заказы"), KeyboardButton(text="ℹ️ О магазине")],
+        ]
     if is_admin:
         rows.append([KeyboardButton(text="⚙️ Админ-панель")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -169,4 +175,50 @@ def admin_order_kb(order_id: int) -> InlineKeyboardMarkup:
 def back_admin_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Назад", callback_data="a_menu")
+    return kb.as_markup()
+
+
+# ------------------------------------------------------------- покупка звёзд
+
+def star_packages_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for quantity in settings.star_packages:
+        kb.button(text=f"{quantity} ⭐ · {money(quantity * settings.star_price)}",
+                  callback_data=f"st_qty_{quantity}")
+    kb.button(text="✏️ Другое количество", callback_data="st_custom")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+def star_recipient_kb(username: str | None) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    if username:
+        kb.button(text=f"Себе (@{username})", callback_data="st_me")
+    kb.button(text="⬅️ Изменить количество", callback_data="st_start")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def star_confirm_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💎 Оплатить в TON", callback_data="st_pay")
+    kb.button(text="❌ Отменить", callback_data="st_cancel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def ton_invoice_kb(order_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔄 Я оплатил, проверить", callback_data=f"st_check_{order_id}")
+    kb.button(text="❌ Отменить заказ", callback_data=f"st_drop_{order_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def admin_star_order_kb(order_id: int) -> InlineKeyboardMarkup:
+    """Кнопки под задачей «купить вручную»."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Купил, зачислено", callback_data=f"a_stdone_{order_id}")
+    kb.button(text="🔁 Повторить автозакупку", callback_data=f"a_stretry_{order_id}")
+    kb.adjust(1)
     return kb.as_markup()

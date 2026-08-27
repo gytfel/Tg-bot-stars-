@@ -34,10 +34,19 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await db.upsert_user(message.from_user.id, message.from_user.username,
                          message.from_user.full_name)
+    if settings.stars_shop:
+        from stars import price_rub
+        greeting = (f"⭐ Звёзды Telegram по <b>{money(settings.star_price)}</b> за штуку.\n"
+                    f"Минимальный заказ — {settings.min_stars} ⭐ "
+                    f"({money(price_rub(settings.min_stars))}).\n\n"
+                    f"Нажмите «⭐ Купить звёзды», выберите количество и получателя — "
+                    f"зачислим сразу после оплаты.")
+    else:
+        greeting = "Выберите товар в каталоге и оформите заказ прямо здесь."
+
     await message.answer(
         f"👋 Привет, {escape(message.from_user.first_name)}!\n\n"
-        f"Добро пожаловать в <b>{escape(settings.shop_name)}</b>.\n"
-        f"Выберите товар в каталоге и оформите заказ прямо здесь.",
+        f"Добро пожаловать в <b>{escape(settings.shop_name)}</b>.\n{greeting}",
         reply_markup=kb.main_menu(settings.is_admin(message.from_user.id)),
     )
 
@@ -45,10 +54,21 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.message(Command("help"))
 @router.message(F.text == "ℹ️ О магазине")
 async def about(message: Message):
-    text = (f"<b>{escape(settings.shop_name)}</b>\n\n"
-            "🛍 «Каталог» — выбрать товары\n"
-            "🛒 «Корзина» — оформить заказ\n"
-            "📦 «Мои заказы» — статус ваших заказов\n")
+    if settings.stars_shop:
+        from stars import price_rub
+        text = (f"<b>{escape(settings.shop_name)}</b>\n\n"
+                f"⭐ Цена: <b>{money(settings.star_price)}</b> за звезду\n"
+                f"📦 Минимум: <b>{settings.min_stars} ⭐</b> "
+                f"({money(price_rub(settings.min_stars))})\n"
+                f"💎 Оплата: перевод в TON, счёт выставляем по актуальному курсу\n"
+                f"⚡️ Зачисление: сразу после того, как увидим перевод\n\n"
+                f"Звёзды можно купить и в подарок — на шаге получателя укажите "
+                f"чужой @username.\n")
+    else:
+        text = (f"<b>{escape(settings.shop_name)}</b>\n\n"
+                "🛍 «Каталог» — выбрать товары\n"
+                "🛒 «Корзина» — оформить заказ\n"
+                "📦 «Мои заказы» — статус ваших заказов\n")
     if settings.support:
         text += f"\n💬 Связь с нами: {escape(settings.support)}"
     await message.answer(text)
@@ -296,7 +316,7 @@ async def checkout_payment(callback: CallbackQuery, state: FSMContext):
             f"<b>Итого: {money(db.cart_total(items))}</b>\n\n"
             f"{_contacts_block(data)}"
             f"💳 {PAYMENTS[method]}")
-    if method == "online" and settings.stars_mode:
+    if method == "online" and settings.pay_in_stars:
         text += f"\n\n⭐ К оплате: <b>{stars(to_stars(db.cart_total(items)))}</b>"
     if data.get("comment"):
         text += f"\n💬 {escape(data['comment'])}"
@@ -385,7 +405,7 @@ def invoice_prices(items: list[dict]) -> list[LabeledPrice]:
     Обычная валюта: сумма в минимальных единицах (копейках/центах).
     """
     total = db.cart_total(items)
-    if settings.stars_mode:
+    if settings.pay_in_stars:
         return [LabeledPrice(label=f"Заказ ({len(items)} поз.)", amount=to_stars(total))]
     return [LabeledPrice(label=f"{i['title']} ×{i['quantity']}"[:32],
                          amount=int(round(i["price"] * i["quantity"] * 100)))

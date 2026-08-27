@@ -8,6 +8,14 @@ import keyboards as kb
 from conftest import ADMIN_ID, USER_ID, callback_update, payment_update, text_update
 
 
+@pytest.fixture(autouse=True)
+def digital_mode(monkeypatch):
+    """Эти сценарии — магазин цифровых товаров, а не продажа звёзд."""
+    from config import settings
+    monkeypatch.setattr(settings, "shop_mode", "digital")
+    monkeypatch.setattr(settings, "payment_currency", "XTR")   # оплата звёздами
+
+
 @pytest.fixture
 async def catalog(db_file):
     cat_id = await db.add_category("📚 Курсы")

@@ -56,7 +56,16 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at     TEXT NOT NULL,
     currency       TEXT,
     charge_id      TEXT,
-    paid_at        TEXT
+    paid_at        TEXT,
+    delivered_at   TEXT,
+    stars_qty      INTEGER,
+    recipient      TEXT,
+    fragment_ref   TEXT,
+    fragment_error TEXT,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    ton_amount     REAL,
+    ton_comment    TEXT,
+    ton_tx         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS order_items (
@@ -71,6 +80,7 @@ CREATE TABLE IF NOT EXISTS order_items (
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_user   ON orders(user_id);
+CREATE INDEX IF NOT EXISTS idx_orders_ton     ON orders(ton_comment);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_items_order   ON order_items(order_id);
 CREATE INDEX IF NOT EXISTS idx_products_cat  ON products(category_id);
@@ -83,6 +93,14 @@ MIGRATIONS = {
         "charge_id": "ALTER TABLE orders ADD COLUMN charge_id TEXT",
         "paid_at": "ALTER TABLE orders ADD COLUMN paid_at TEXT",
         "delivered_at": "ALTER TABLE orders ADD COLUMN delivered_at TEXT",
+        "stars_qty": "ALTER TABLE orders ADD COLUMN stars_qty INTEGER",
+        "recipient": "ALTER TABLE orders ADD COLUMN recipient TEXT",
+        "fragment_ref": "ALTER TABLE orders ADD COLUMN fragment_ref TEXT",
+        "fragment_error": "ALTER TABLE orders ADD COLUMN fragment_error TEXT",
+        "attempts": "ALTER TABLE orders ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+        "ton_amount": "ALTER TABLE orders ADD COLUMN ton_amount REAL",
+        "ton_comment": "ALTER TABLE orders ADD COLUMN ton_comment TEXT",
+        "ton_tx": "ALTER TABLE orders ADD COLUMN ton_tx TEXT",
     },
     "products": {
         "content": "ALTER TABLE products ADD COLUMN content TEXT",
@@ -311,6 +329,71 @@ async def create_order(user_id: int, data: dict, items: list[dict],
         if clear_cart:
             await conn.execute("DELETE FROM cart_items WHERE user_id = ?", (user_id,))
     return order_id
+
+
+async def create_star_order(user_id: int, quantity: int, recipient: str, price: float,
+                            payment: str, ton_amount: float | None = None,
+                            ton_comment: str | None = None, status: str = "pending") -> int:
+    """Заказ на звёзды: одна позиция, получатель и сумма в TON для сверки."""
+    async with db() as conn:
+        cur = await conn.execute(
+            """INSERT INTO orders
+               (user_id, total, name, payment_method, status, created_at,
+                currency, stars_qty, recipient, ton_amount, ton_comment)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, price, recipient, payment, status,
+             datetime.now().isoformat(timespec="seconds"),
+             "TON" if ton_amount else None, quantity, recipient, ton_amount, ton_comment),
+        )
+        order_id = cur.lastrowid
+        await conn.execute(
+            """INSERT INTO order_items (order_id, product_id, title, price, quantity)
+               VALUES (?, NULL, ?, ?, 1)""",
+            (order_id, f"{quantity} ⭐ на @{recipient}", price),
+        )
+    return order_id
+
+
+async def pending_ton_orders() -> list[dict]:
+    """Заказы, которые ждут перевода в TON."""
+    async with db() as conn:
+        rows = await (await conn.execute(
+            """SELECT * FROM orders
+               WHERE status = 'pending' AND ton_comment IS NOT NULL
+               ORDER BY id""")).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def undelivered_star_orders() -> list[dict]:
+    """Оплаченные заказы на звёзды, которые ещё не выданы."""
+    async with db() as conn:
+        rows = await (await conn.execute(
+            """SELECT * FROM orders
+               WHERE stars_qty IS NOT NULL AND delivered_at IS NULL
+                 AND status IN ('paid', 'new')
+               ORDER BY id""")).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def set_ton_comment(order_id: int, comment: str) -> None:
+    async with db() as conn:
+        await conn.execute("UPDATE orders SET ton_comment = ? WHERE id = ?",
+                           (comment, order_id))
+
+
+async def set_ton_payment(order_id: int, tx_hash: str) -> None:
+    async with db() as conn:
+        await conn.execute("UPDATE orders SET ton_tx = ? WHERE id = ?", (tx_hash, order_id))
+
+
+async def set_fragment_result(order_id: int, reference: str | None = None,
+                              error: str | None = None) -> None:
+    async with db() as conn:
+        await conn.execute(
+            """UPDATE orders SET fragment_ref = COALESCE(?, fragment_ref),
+                                 fragment_error = ?, attempts = attempts + 1
+               WHERE id = ?""",
+            (reference, error, order_id))
 
 
 async def mark_paid(order_id: int, charge_id: str | None = None,

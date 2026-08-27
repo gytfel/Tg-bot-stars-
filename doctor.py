@@ -27,7 +27,9 @@ async def check_config() -> bool:
         line(FAIL if problem in blocking else WARN, problem)
     if not problems:
         line(OK, "Файл .env заполнен корректно")
-    line(OK, f"Магазин: {settings.shop_name} · валюта {settings.currency} · "
+    kind = {"stars": "продажа звёзд", "digital": "цифровой товар",
+            "physical": "физический товар"}.get(settings.shop_mode, settings.shop_mode)
+    line(OK, f"Магазин: {settings.shop_name} · {kind} · валюта {settings.currency} · "
              f"режим {settings.mode}")
     line(OK, f"Админы: {', '.join(map(str, settings.admin_ids)) or 'нет'}")
     return not blocking
@@ -97,10 +99,69 @@ async def check_telegram() -> bool:
         await bot.session.close()
 
 
+async def check_stars_shop() -> bool:
+    """Проверки, которые важны только магазину звёзд."""
+    print("\n— Продажа звёзд —")
+    line(OK, f"Цена: {settings.star_price} {settings.currency} за ⭐ · "
+             f"минимум {settings.min_stars} ⭐")
+    packages = ", ".join(str(x) for x in settings.star_packages)
+    line(OK, f"Наборы: {packages or 'только своё количество'}")
+
+    ok = True
+
+    # --- приём оплаты
+    if settings.ton_enabled:
+        line(OK, f"Оплата в TON на {settings.ton_wallet}")
+        try:
+            import ton
+            rate = await ton.rate_rub()
+            source = "из .env" if settings.ton_rate_rub else "из API"
+            line(OK, f"Курс: 1 TON = {rate} {settings.currency} ({source})")
+            example = settings.min_stars * settings.star_price
+            line(OK, f"Минимальный заказ: {settings.min_stars} ⭐ = {example} "
+                     f"{settings.currency} = {ton.to_ton(example, rate)} TON")
+        except Exception as e:  # noqa: BLE001
+            line(FAIL, f"Курс TON недоступен: {e}")
+            ok = False
+    elif settings.payment_token:
+        line(WARN, "TON не настроен, оплата пойдёт через платёжного провайдера")
+    else:
+        line(FAIL, "Принимать оплату нечем: нет ни TON_WALLET, ни токена провайдера")
+        ok = False
+
+    # --- закупка звёзд
+    if settings.fragment_auto:
+        line(OK, f"Закупка: шлюз {settings.fragment_url}")
+        import fragment
+        balance = await fragment.get_client().balance()
+        if balance is None:
+            line(WARN, "Шлюз не ответил на запрос баланса — проверьте адрес и токен")
+        else:
+            line(OK, f"Баланс шлюза: {balance}")
+            if settings.fragment_min_balance and balance < settings.fragment_min_balance:
+                line(WARN, f"Баланс ниже порога {settings.fragment_min_balance}")
+    else:
+        line(WARN, "Закупка вручную: бот пришлёт задачу админу, покупка на fragment.com. "
+                   "Автозакупка — FRAGMENT_MODE=api")
+
+    waiting = []
+    try:
+        waiting = await __import__("database").undelivered_star_orders()
+    except Exception:  # noqa: BLE001 — база проверяется отдельно
+        pass
+    if waiting:
+        line(WARN, f"Оплачено, но не выдано: {len(waiting)} заказ(ов). "
+                   f"Список: python manage.py stars pending")
+    return ok
+
+
 async def check_payments() -> bool:
+    if settings.stars_shop:
+        return await check_stars_shop()
+
     print("\n— Оплата —")
     line(OK, "Всегда доступны: при получении, перевод на карту")
-    if settings.stars_mode:
+    if settings.pay_in_stars:
         line(OK, f"Онлайн: Telegram Stars (XTR), курс {settings.stars_rate} "
                  f"{settings.currency} за ⭐ — провайдер и договор не нужны")
     elif settings.payment_token:

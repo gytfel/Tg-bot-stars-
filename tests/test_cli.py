@@ -16,6 +16,14 @@ def no_color(monkeypatch):
     monkeypatch.setenv("NO_COLOR", "1")
 
 
+@pytest.fixture(autouse=True)
+def digital_mode(monkeypatch):
+    """Каталожные команды проверяем на магазине цифровых товаров."""
+    from config import settings
+    monkeypatch.setattr(settings, "shop_mode", "digital")
+    monkeypatch.setattr(settings, "payment_currency", "XTR")
+
+
 @pytest.fixture
 def shop(db_file):
     async def build():
@@ -243,3 +251,132 @@ def test_broadcast_sends_to_every_user(shop, fake_telegram, monkeypatch, capsys)
     assert "Доставлено: 1" in out
     assert any("Новый курс" in (c.text or "")
                for c in fake_telegram.named("SendMessage"))
+
+
+
+# --------------------------------------------------------------- звёзды
+
+@pytest.fixture
+def stars_mode(monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "shop_mode", "stars")
+    monkeypatch.setattr(settings, "payment_currency", "RUB")
+    monkeypatch.setattr(settings, "star_price", 1.6)
+    monkeypatch.setattr(settings, "min_stars", 50)
+    monkeypatch.setattr(settings, "star_packages", [50, 100, 1000])
+    monkeypatch.setattr(settings, "ton_wallet", "UQshop")
+    monkeypatch.setattr(settings, "ton_rate_rub", 320.0)
+    return settings
+
+
+@pytest.fixture
+def star_order(db_file, stars_mode):
+    async def build():
+        await db.init_db()
+        await db.upsert_user(2000, "ivan", "Иван")
+        order_id = await db.create_star_order(2000, 500, "buyer_one", 800, "ton",
+                                              ton_amount=2.5, ton_comment="order_1")
+        await db.set_ton_comment(order_id, f"order_{order_id}")
+        await db.mark_paid(order_id, "tx_1", "TON")
+        return order_id
+
+    return asyncio.run(build())
+
+
+def test_stars_price_list(stars_mode, db_file, capsys):
+    run("stars", "price")
+    out = capsys.readouterr().out
+    assert "50 ⭐" in out and "80 ₽" in out
+    assert "1000 ⭐" in out and "1 600 ₽" in out
+    assert "0.25 TON" in out
+    assert "минимум 50" in out
+
+
+def test_stars_rate_from_env(stars_mode, db_file, capsys):
+    run("stars", "rate")
+    assert "320 ₽" in capsys.readouterr().out
+
+
+def test_stars_pending_lists_unfulfilled(star_order, capsys):
+    run("stars", "pending")
+    out = capsys.readouterr().out
+    assert f"{star_order}" in out and "500" in out and "buyer_one" in out
+
+
+def test_stars_balance_needs_a_gateway(stars_mode, db_file, capsys):
+    with pytest.raises(SystemExit):
+        run("stars", "balance")
+    assert "manual" in capsys.readouterr().out
+
+
+def test_stars_fulfil_manual_closes_order(star_order, fake_telegram, capsys):
+    run("stars", "fulfil", str(star_order), "--manual", "--ref", "FRG-manual")
+    assert "закрыт" in capsys.readouterr().out
+
+    order = asyncio.run(db.get_order(star_order))
+    assert order["status"] == "done"
+    assert order["fragment_ref"] == "FRG-manual"
+    sent = [c.text for c in fake_telegram.named("SendMessage") if c.chat_id == 2000]
+    assert any("зачислены" in t for t in sent)
+
+
+def test_stars_fulfil_twice_is_refused(star_order, fake_telegram, capsys):
+    run("stars", "fulfil", str(star_order), "--manual")
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("stars", "fulfil", str(star_order), "--manual")
+    assert "уже выдан" in capsys.readouterr().out
+
+
+def test_stars_fulfil_uses_the_gateway(star_order, fake_telegram, monkeypatch, capsys):
+    import fragment
+
+    class Stub:
+        mode = "api"
+
+        async def buy_stars(self, username, quantity, reference):
+            assert (username, quantity) == ("buyer_one", 500)
+            return fragment.Purchase(ok=True, reference="FRG-77")
+
+        async def balance(self):
+            return 1.0
+
+    monkeypatch.setattr(fragment, "get_client", Stub)
+    run("stars", "fulfil", str(star_order))
+    assert "FRG-77" in capsys.readouterr().out
+    assert asyncio.run(db.get_order(star_order))["fragment_ref"] == "FRG-77"
+
+
+def test_stars_check_confirms_payment(stars_mode, db_file, fake_telegram, monkeypatch, capsys):
+    import ton
+
+    async def build():
+        await db.init_db()
+        order_id = await db.create_star_order(2000, 100, "buyer_one", 160, "ton",
+                                              ton_amount=0.5, ton_comment="x")
+        await db.set_ton_comment(order_id, f"order_{order_id}")
+        return order_id
+
+    order_id = asyncio.run(build())
+
+    async def incoming(limit=100):
+        return [{"comment": f"order_{order_id}", "ton": 0.5, "nano": 5 * 10**8,
+                 "hash": "tx_ok", "source": "UQbuyer"}]
+
+    monkeypatch.setattr(ton, "incoming", incoming)
+    run("stars", "check")
+    assert "Подтверждено оплат: 1" in capsys.readouterr().out
+    assert asyncio.run(db.get_order(order_id))["ton_tx"] == "tx_ok"
+
+
+def test_orders_table_shows_recipient(star_order, capsys):
+    run("orders")
+    out = capsys.readouterr().out
+    assert "@buyer_one" in out and "500" in out
+
+
+def test_order_card_shows_ton_details(star_order, capsys):
+    run("order", "show", str(star_order))
+    out = capsys.readouterr().out
+    assert "500 ⭐ → @buyer_one" in out
+    assert "2.5" in out and f"order_{star_order}" in out

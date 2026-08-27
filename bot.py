@@ -17,19 +17,31 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, ErrorEvent
 
 import handlers_admin
+import handlers_stars
 import handlers_user
 from config import settings
 from database import init_db
 
 log = logging.getLogger(__name__)
 
-COMMANDS = [
+STARS_COMMANDS = [
+    BotCommand(command="start", description="Главное меню"),
+    BotCommand(command="buy", description="Купить звёзды"),
+    BotCommand(command="orders", description="Мои заказы"),
+    BotCommand(command="help", description="О магазине"),
+]
+
+SHOP_COMMANDS = [
     BotCommand(command="start", description="Главное меню"),
     BotCommand(command="catalog", description="Каталог товаров"),
     BotCommand(command="cart", description="Корзина"),
     BotCommand(command="orders", description="Мои заказы"),
     BotCommand(command="help", description="О магазине"),
 ]
+
+
+def commands() -> list[BotCommand]:
+    return STARS_COMMANDS if settings.stars_shop else SHOP_COMMANDS
 
 
 def setup_logging() -> None:
@@ -56,6 +68,7 @@ def create_dispatcher() -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
     # админский роутер идёт первым — у него приоритет
     dp.include_router(handlers_admin.router)
+    dp.include_router(handlers_stars.router)
     dp.include_router(handlers_user.router)
     dp.errors.register(on_error)
     return dp
@@ -78,15 +91,41 @@ async def on_error(event: ErrorEvent) -> bool:
 
 async def on_startup(bot: Bot) -> None:
     await init_db()
-    await bot.set_my_commands(COMMANDS)
+    await bot.set_my_commands(commands())
     me = await bot.get_me()
     log.info("Бот @%s запущен в режиме %s", me.username, settings.mode)
+    if settings.stars_shop:
+        log.info("Продажа звёзд: %s ₽ за ⭐, минимум %s ⭐, закупка — %s",
+                 settings.star_price, settings.min_stars,
+                 "Fragment API" if settings.fragment_auto else "вручную")
+
+
+def start_ton_watcher(bot: Bot) -> "asyncio.Task | None":
+    """Фоновая проверка входящих переводов в TON."""
+    if not (settings.stars_shop and settings.ton_enabled):
+        return None
+    import ton
+    return asyncio.create_task(ton.watcher(bot), name="ton-watcher")
+
+
+async def stop_ton_watcher(task) -> None:
+    if not task:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 async def run_polling(bot: Bot, dp: Dispatcher) -> None:
     await on_startup(bot)
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    watcher = start_ton_watcher(bot)
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await stop_ton_watcher(watcher)
 
 
 def build_app(bot: Bot, dp: Dispatcher):
@@ -123,9 +162,11 @@ async def run_webhook(bot: Bot, dp: Dispatcher) -> None:
     site = web.TCPSite(runner, host=settings.host, port=settings.port)
     await site.start()
     log.info("Слушаю %s:%s (healthcheck: /healthz)", settings.host, settings.port)
+    watcher = start_ton_watcher(bot)
     try:
         await asyncio.Event().wait()          # работаем, пока не остановят
     finally:
+        await stop_ton_watcher(watcher)
         await runner.cleanup()
 
 

@@ -114,12 +114,13 @@ async def session(bot: Bot) -> FakeSession:
 async def dp(db_file, monkeypatch) -> Dispatcher:
     import bot as bot_module
     import handlers_admin
+    import handlers_stars
     import handlers_user
     from database import init_db
 
     await init_db()
     # роутеры — модульные синглтоны: отвязываем от диспетчера прошлого теста
-    for router in (handlers_admin.router, handlers_user.router):
+    for router in (handlers_admin.router, handlers_stars.router, handlers_user.router):
         router._parent_router = None
 
     # ловим падения хендлеров: тест не должен «зеленеть» на съеденном исключении

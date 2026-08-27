@@ -42,6 +42,10 @@ PHYSICAL = {
 
 async def main() -> None:
     await db.init_db()
+    if settings.stars_shop:
+        print("Режим продажи звёзд — каталог не нужен: количество покупатель "
+              "выбирает сам.\nПрайс: python manage.py stars price")
+        return
     if await db.get_categories(only_active=False):
         print("В базе уже есть категории — пропускаю.")
         return

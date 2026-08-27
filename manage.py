@@ -54,7 +54,7 @@ def table(headers: list[str], rows: list[list[str]]) -> None:
 
 def price_of(value: float) -> str:
     """Цена в валюте магазина, а для Stars — ещё и в звёздах."""
-    if settings.stars_mode:
+    if settings.pay_in_stars:
         return f"{stars(to_stars(value))} ({money(value)})"
     return money(value)
 
@@ -130,13 +130,20 @@ def service_state() -> str:
 
 # --------------------------------------------------------------------- команды
 
+KIND = {"stars": "продажа звёзд", "digital": "цифровой товар",
+        "physical": "физический товар"}
+
+
 async def cmd_status(args) -> None:
     title("Бот")
-    print(f"  Магазин:  {settings.shop_name} · "
-          f"{'цифровой' if settings.digital else 'физический'} товар")
+    print(f"  Магазин:  {settings.shop_name} · {KIND.get(settings.shop_mode, '—')}")
     print(f"  Режим:    {settings.mode} · логи {settings.log_level}")
     print(f"  Оплата:   {payment_summary()}")
     print(f"  Сервис:   {service_state()}")
+    if settings.stars_shop:
+        print(f"  Звёзды:   {money(settings.star_price)} за ⭐ · минимум "
+              f"{settings.min_stars} ⭐ · закупка "
+              f"{'через шлюз' if settings.fragment_auto else 'вручную'}")
 
     problems = settings.validate()
     if problems:
@@ -155,7 +162,9 @@ async def cmd_status(args) -> None:
 
 
 def payment_summary() -> str:
-    if settings.stars_mode:
+    if settings.stars_shop and settings.ton_enabled:
+        return f"TON на {settings.ton_wallet[:12]}…"
+    if settings.pay_in_stars:
         return f"Telegram Stars, {settings.stars_rate} {settings.currency} за ⭐"
     if settings.payment_token:
         return f"провайдер {settings.payment_token.split(':')[0]}, {settings.payment_currency}"
@@ -246,6 +255,12 @@ async def cmd_orders(args) -> None:
     if args.status:
         orders = [o for o in orders if o["status"] == args.status]
     title(f"Заказы ({len(orders)})")
+    if settings.stars_shop:
+        table(["id", "дата", "звёзд", "получатель", "сумма", "статус"],
+              [[o["id"], o["created_at"][:16].replace("T", " "), o["stars_qty"] or "—",
+                f"@{o['recipient']}" if o["recipient"] else "—", money(o["total"]),
+                STATUSES.get(o["status"], o["status"])] for o in orders])
+        return
     table(["id", "дата", "сумма", "статус", "оплата", "клиент"],
           [[o["id"], o["created_at"][:16].replace("T", " "), money(o["total"]),
             STATUSES.get(o["status"], o["status"]),
@@ -269,6 +284,14 @@ async def cmd_order(args) -> None:
         print(f"  Оплачен:  {order['paid_at'].replace('T', ' ')}")
     if order["delivered_at"]:
         print(f"  Выдан:    {order['delivered_at'].replace('T', ' ')}")
+    if order["stars_qty"]:
+        print(f"  Звёзды:   {order['stars_qty']} ⭐ → @{order['recipient']}")
+        print(f"  Fragment: {order['fragment_ref'] or '—'}"
+              f"{'  ⚠️ ' + order['fragment_error'] if order['fragment_error'] else ''}"
+              f" · попыток {order['attempts']}")
+    if order["ton_amount"]:
+        print(f"  TON:      {order['ton_amount']} с комментарием {order['ton_comment']}"
+              f"{' · ' + order['ton_tx'] if order['ton_tx'] else ''}")
     print(f"  Клиент:   {order['name'] or '—'} · id {order['user_id']}")
     for label, key in (("Телефон", "phone"), ("Адрес", "address"), ("Комментарий", "comment")):
         if order[key]:
@@ -406,6 +429,93 @@ def cmd_run(args) -> None:
     asyncio.run(bot_module.main())
 
 
+async def cmd_stars(args) -> None:
+    await db.init_db()
+
+    if args.action == "price":
+        title("Прайс")
+        rate = await _ton_rate_or_none()
+        rows = []
+        for quantity in (settings.star_packages or [settings.min_stars]):
+            price = quantity * settings.star_price
+            rows.append([f"{quantity} ⭐", money(price),
+                         f"{__import__('ton').to_ton(price, rate)} TON" if rate else "—"])
+        table(["набор", "цена", "в TON"], rows)
+        print(paint(f"\n  {money(settings.star_price)} за ⭐ · минимум "
+                    f"{settings.min_stars} ⭐", "grey"))
+        return
+
+    if args.action == "rate":
+        import ton
+        try:
+            rate = await ton.rate_rub(force=True)
+        except Exception as e:  # noqa: BLE001
+            fail(f"Курс TON недоступен: {e}")
+        source = "из .env" if settings.ton_rate_rub else "из API"
+        done(f"1 TON = {money(rate)} ({source})")
+        return
+
+    if args.action == "balance":
+        import fragment
+        client = fragment.get_client()
+        if client.mode == "manual":
+            fail("Шлюз не подключён: FRAGMENT_MODE=manual. Баланс смотрите на fragment.com")
+        balance = await client.balance()
+        if balance is None:
+            fail("Шлюз не ответил на запрос баланса")
+        done(f"Баланс шлюза: {balance}")
+        return
+
+    if args.action == "pending":
+        waiting = await db.undelivered_star_orders()
+        title(f"Оплачено, но не выдано ({len(waiting)})")
+        table(["id", "звёзд", "получатель", "сумма", "попыток", "ошибка"],
+              [[o["id"], o["stars_qty"], f"@{o['recipient']}", money(o["total"]),
+                o["attempts"], short(o["fragment_error"], 40)] for o in waiting])
+        return
+
+    if args.action == "check":
+        import ton
+        if not settings.ton_enabled:
+            fail("TON_WALLET не задан — проверять нечего")
+        async with telegram() as bot:
+            confirmed = await ton.check_pending(bot)
+        done(f"Подтверждено оплат: {confirmed}")
+        return
+
+    if args.action == "fulfil":
+        import stars as stars_module
+        order = await db.get_order(args.id)
+        if not order:
+            fail(f"Заказа #{args.id} нет")
+        if not order["stars_qty"]:
+            fail(f"Заказ #{args.id} — не про звёзды")
+        if order["delivered_at"]:
+            fail(f"Заказ #{args.id} уже выдан ({order['delivered_at']})")
+
+        async with telegram() as bot:
+            if args.manual:
+                if await stars_module.deliver_manually(bot, args.id, args.ref):
+                    done(f"Заказ #{args.id} закрыт: {order['stars_qty']} ⭐ "
+                         f"на @{order['recipient']}")
+                else:
+                    fail("Заказ уже закрыт")
+                return
+            result = await stars_module.fulfil(bot, args.id)
+        if result.ok:
+            done(f"Заказ #{args.id}: {result}")
+        else:
+            fail(f"Заказ #{args.id}: {result}")
+
+
+async def _ton_rate_or_none() -> float | None:
+    import ton
+    try:
+        return await ton.rate_rub()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # ------------------------------------------------------------------- Telegram
 
 class telegram:
@@ -441,6 +551,8 @@ def build_parser() -> argparse.ArgumentParser:
                "  python manage.py product content 3 \"https://example.com/course\"\n"
                "  python manage.py orders --status new\n"
                "  python manage.py order status 12 paid\n"
+               "  python manage.py stars pending\n"
+               "  python manage.py stars fulfil 12 --manual\n"
                "  python manage.py broadcast \"Новый курс уже в каталоге\" --dry-run\n")
     sub = parser.add_subparsers(dest="command", required=True, metavar="команда")
 
@@ -522,6 +634,25 @@ def build_parser() -> argparse.ArgumentParser:
     refund = sub.add_parser("refund", help="вернуть оплату звёздами")
     refund.add_argument("id", type=int)
     refund.set_defaults(func=cmd_refund)
+
+    # --- звёзды
+    stars_cmd = sub.add_parser(
+        "stars", help="звёзды: price, rate, balance, pending, check, fulfil")
+    stars_sub = stars_cmd.add_subparsers(dest="action", required=True, metavar="действие")
+    for name, help_text in (("price", "прайс по наборам"),
+                            ("rate", "текущий курс TON"),
+                            ("balance", "баланс шлюза Fragment"),
+                            ("pending", "оплачено, но не выдано"),
+                            ("check", "разово проверить входящие переводы")):
+        item = stars_sub.add_parser(name, help=help_text)
+        item.set_defaults(func=cmd_stars, action=name)
+
+    fulfil = stars_sub.add_parser("fulfil", help="выдать звёзды по заказу")
+    fulfil.add_argument("id", type=int)
+    fulfil.add_argument("--manual", action="store_true",
+                        help="звёзды куплены вручную — просто закрыть заказ")
+    fulfil.add_argument("--ref", help="номер операции для истории")
+    fulfil.set_defaults(func=cmd_stars, action="fulfil")
 
     # --- прочее
     users = sub.add_parser("users", help="кто пользуется ботом")

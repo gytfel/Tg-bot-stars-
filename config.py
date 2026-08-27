@@ -29,6 +29,11 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _packages() -> list[int]:
+    raw = os.getenv("STAR_PACKAGES", "50,100,250,500,1000")
+    return sorted({int(x) for x in raw.replace(" ", "").split(",") if x.isdigit()})
+
+
 @dataclass
 class Settings:
     bot_token: str = os.getenv("BOT_TOKEN", "")
@@ -38,15 +43,46 @@ class Settings:
     db_path: str = os.getenv("DB_PATH", "shop.db")
     support: str = os.getenv("SUPPORT_CONTACT", "")
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
+    # stars    — продажа Telegram Stars: покупатель выбирает количество и получает
+    #            звёзды на свой @username после оплаты
     # digital  — цифровой товар: без адреса доставки, выдача сразу после оплаты
     # physical — физический: анкета с телефоном и адресом, оплата при получении
-    shop_mode: str = os.getenv("SHOP_MODE", "digital").lower()
+    shop_mode: str = os.getenv("SHOP_MODE", "stars").lower()
 
     # --- оплата -------------------------------------------------------------
     payment_token: str = os.getenv("PAYMENT_PROVIDER_TOKEN", "")
-    payment_currency: str = os.getenv("PAYMENT_CURRENCY_CODE", "XTR").upper()
+    payment_currency: str = os.getenv("PAYMENT_CURRENCY_CODE", "RUB").upper()
     # сколько единиц валюты магазина стоит одна ⭐ (для режима Telegram Stars)
     stars_rate: float = _float("STARS_RATE", 2.0)
+
+    # --- продажа звёзд ------------------------------------------------------
+    star_price: float = _float("STAR_PRICE", 1.6)      # ₽ за одну ⭐ при продаже
+    min_stars: int = _int("MIN_STARS", 50)             # у Fragment минимум 50
+    max_stars: int = _int("MAX_STARS", 100_000)
+    star_packages: list[int] = field(default_factory=_packages)
+
+    # --- закупка звёзд через Fragment ---------------------------------------
+    # manual — админ покупает вручную и подтверждает выдачу
+    # api    — автозакупка через сторонний шлюз к Fragment
+    fragment_mode: str = os.getenv("FRAGMENT_MODE", "manual").lower()
+    fragment_url: str = os.getenv("FRAGMENT_API_URL", "").rstrip("/")
+    fragment_token: str = os.getenv("FRAGMENT_API_TOKEN", "")
+    fragment_buy_path: str = os.getenv("FRAGMENT_BUY_PATH", "/buyStars")
+    fragment_balance_path: str = os.getenv("FRAGMENT_BALANCE_PATH", "/balance")
+    fragment_timeout: int = _int("FRAGMENT_TIMEOUT", 60)
+    fragment_retries: int = _int("FRAGMENT_RETRIES", 3)
+    fragment_min_balance: float = _float("FRAGMENT_MIN_BALANCE", 0)
+
+    # --- оплата в TON -------------------------------------------------------
+    ton_wallet: str = os.getenv("TON_WALLET", "")
+    ton_api_url: str = os.getenv("TON_API_URL", "https://toncenter.com/api/v3").rstrip("/")
+    ton_api_key: str = os.getenv("TON_API_KEY", "")
+    ton_rate_rub: float = _float("TON_RATE_RUB", 0)    # 0 — брать курс из API
+    ton_rate_url: str = os.getenv(
+        "TON_RATE_URL", "https://tonapi.io/v2/rates?tokens=ton&currencies=rub")
+    ton_check_interval: int = _int("TON_CHECK_INTERVAL", 60)
+    ton_tolerance: float = _float("TON_TOLERANCE", 0.02)   # допуск на комиссию, 2%
+    ton_invoice_ttl: int = _int("TON_INVOICE_TTL", 3600)   # сколько ждать оплату, сек
 
     # --- подключение к серверу ---------------------------------------------
     # polling — бот сам ходит в Telegram (проще, работает без домена)
@@ -67,17 +103,31 @@ class Settings:
 
     @property
     def digital(self) -> bool:
-        return self.shop_mode == "digital"
+        """Товар не нужно везти: ни телефона, ни адреса в оформлении."""
+        return self.shop_mode != "physical"
 
     @property
-    def stars_mode(self) -> bool:
+    def stars_shop(self) -> bool:
+        """Магазин продаёт сами звёзды."""
+        return self.shop_mode == "stars"
+
+    @property
+    def ton_enabled(self) -> bool:
+        return bool(self.ton_wallet)
+
+    @property
+    def fragment_auto(self) -> bool:
+        return self.fragment_mode == "api" and bool(self.fragment_url)
+
+    @property
+    def pay_in_stars(self) -> bool:
         """Оплата в Telegram Stars: провайдер не нужен, валюта XTR."""
         return self.payment_currency == STARS_CURRENCY
 
     @property
     def online_enabled(self) -> bool:
         """Показывать ли кнопку онлайн-оплаты."""
-        return self.stars_mode or bool(self.payment_token)
+        return self.pay_in_stars or bool(self.payment_token)
 
     @property
     def webhook_url(self) -> str:
@@ -94,12 +144,14 @@ class Settings:
             problems.append("BOT_TOKEN выглядит некорректно (нет двоеточия)")
         if not self.admin_ids:
             problems.append("ADMIN_IDS пуст — админ-панель будет недоступна")
-        if self.shop_mode not in {"digital", "physical"}:
-            problems.append(f"SHOP_MODE={self.shop_mode!r}: допустимо digital или physical")
-        if self.digital and self.payment_currency != STARS_CURRENCY and not self.payment_token:
+        if self.shop_mode not in {"stars", "digital", "physical"}:
+            problems.append(f"SHOP_MODE={self.shop_mode!r}: допустимо stars, digital или physical")
+        if self.stars_shop:
+            problems.extend(self._validate_stars_shop())
+        elif self.digital and self.payment_currency != STARS_CURRENCY and not self.payment_token:
             problems.append("Цифровой магазин без онлайн-оплаты: включите Telegram Stars "
                             "(PAYMENT_CURRENCY_CODE=XTR) или укажите токен провайдера")
-        if not self.digital and self.stars_mode:
+        if self.shop_mode == "physical" and self.pay_in_stars:
             problems.append("Telegram Stars нельзя использовать для физических товаров — "
                             "подключите платёжного провайдера")
         if self.mode not in {"polling", "webhook"}:
@@ -110,11 +162,33 @@ class Settings:
             elif not self.webhook_base.startswith("https://"):
                 problems.append("WEBHOOK_URL должен начинаться с https:// — "
                                 "Telegram не примет http")
-        if self.stars_mode and self.payment_token:
+        if self.pay_in_stars and self.payment_token:
             problems.append("Для Telegram Stars токен провайдера не нужен — очистите "
                             "PAYMENT_PROVIDER_TOKEN")
-        if self.stars_mode and self.stars_rate <= 0:
+        if self.pay_in_stars and self.stars_rate <= 0:
             problems.append("STARS_RATE должен быть больше нуля")
+        return problems
+
+    def _validate_stars_shop(self) -> list[str]:
+        problems: list[str] = []
+        if self.pay_in_stars:
+            problems.append("Магазин продаёт звёзды — платить за них звёздами нельзя. "
+                            "Уберите PAYMENT_CURRENCY_CODE=XTR")
+        if not self.ton_enabled and not self.payment_token:
+            problems.append("Принимать оплату нечем: укажите TON_WALLET "
+                            "или токен платёжного провайдера")
+        if self.star_price <= 0:
+            problems.append("STAR_PRICE должен быть больше нуля")
+        if self.min_stars < 50:
+            problems.append("MIN_STARS меньше 50 — Fragment не продаёт меньше 50 ⭐")
+        if self.star_packages and min(self.star_packages) < self.min_stars:
+            problems.append(f"В STAR_PACKAGES есть наборы меньше MIN_STARS={self.min_stars}")
+        if self.fragment_mode not in {"manual", "api"}:
+            problems.append(f"FRAGMENT_MODE={self.fragment_mode!r}: допустимо manual или api")
+        if self.fragment_mode == "api" and not (self.fragment_url and self.fragment_token):
+            problems.append("FRAGMENT_MODE=api требует FRAGMENT_API_URL и FRAGMENT_API_TOKEN")
+        if self.ton_enabled and not self.ton_rate_rub and not self.ton_rate_url:
+            problems.append("Не задан курс TON: укажите TON_RATE_RUB или TON_RATE_URL")
         return problems
 
 

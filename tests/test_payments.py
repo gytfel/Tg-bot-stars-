@@ -14,7 +14,7 @@ async def catalog(db_file):
 
 
 @pytest.fixture
-def stars_mode(monkeypatch):
+def pay_in_stars(monkeypatch):
     from config import settings
     monkeypatch.setattr(settings, "payment_currency", "XTR")
     monkeypatch.setattr(settings, "payment_token", "")
@@ -44,7 +44,7 @@ async def test_online_button_hidden_without_payment_setup(dp, bot, session, cata
     assert "pay_online" not in buttons
 
 
-async def test_stars_invoice_is_single_item_in_xtr(dp, bot, session, catalog, stars_mode):
+async def test_stars_invoice_is_single_item_in_xtr(dp, bot, session, catalog, pay_in_stars):
     await _checkout(dp, bot, catalog["p1"])
     invoice = session.named("SendInvoice")[0]
 
@@ -54,7 +54,7 @@ async def test_stars_invoice_is_single_item_in_xtr(dp, bot, session, catalog, st
     assert not invoice.provider_token, "для Stars токен провайдера не нужен"
 
 
-async def test_stars_payment_marks_order_paid(dp, bot, session, catalog, stars_mode):
+async def test_stars_payment_marks_order_paid(dp, bot, session, catalog, pay_in_stars):
     await _checkout(dp, bot, catalog["p1"])
     order_id = (await db.get_user_orders(USER_ID))[0]["id"]
 
@@ -68,7 +68,7 @@ async def test_stars_payment_marks_order_paid(dp, bot, session, catalog, stars_m
 
 
 async def test_double_payment_notification_does_not_duplicate_admin_alert(
-        dp, bot, session, catalog, stars_mode):
+        dp, bot, session, catalog, pay_in_stars):
     await _checkout(dp, bot, catalog["p1"])
     order_id = (await db.get_user_orders(USER_ID))[0]["id"]
     update = payment_update(445, currency="XTR", payload=f"order_{order_id}")
@@ -96,7 +96,7 @@ async def test_pre_checkout_rejects_unknown_order(dp, bot, session, catalog):
     assert "не найден" in answer.error_message
 
 
-async def test_pre_checkout_accepts_pending_order(dp, bot, session, catalog, stars_mode):
+async def test_pre_checkout_accepts_pending_order(dp, bot, session, catalog, pay_in_stars):
     from aiogram.types import PreCheckoutQuery, Update
     from conftest import make_user
 
@@ -110,7 +110,7 @@ async def test_pre_checkout_accepts_pending_order(dp, bot, session, catalog, sta
     assert session.named("AnswerPreCheckoutQuery")[0].ok is True
 
 
-async def test_admin_refunds_stars(dp, bot, session, catalog, stars_mode):
+async def test_admin_refunds_stars(dp, bot, session, catalog, pay_in_stars):
     await _checkout(dp, bot, catalog["p1"])
     order_id = (await db.get_user_orders(USER_ID))[0]["id"]
     await dp.feed_update(bot, payment_update(445, currency="XTR",

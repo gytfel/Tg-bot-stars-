@@ -11,7 +11,10 @@ from utils import escape, money, to_stars
 
 
 def _settings(**kwargs) -> Settings:
-    base = Settings(bot_token="123:ABC", admin_ids=[1], mode="polling")
+    """Рабочая конфигурация магазина звёзд — от неё пляшут остальные проверки."""
+    base = Settings(bot_token="123:ABC", admin_ids=[1], mode="polling",
+                    shop_mode="stars", payment_currency="RUB",
+                    ton_wallet="UQtest", ton_rate_rub=300)
     return replace(base, **kwargs)
 
 
@@ -35,14 +38,14 @@ def test_webhook_url_is_built_from_base_and_path():
     assert s.webhook_url == "https://shop.ru/tg"
 
 
-def test_stars_mode_detected_by_currency():
-    assert _settings(payment_currency="XTR").stars_mode is True
+def test_pay_in_stars_detected_by_currency():
+    assert _settings(payment_currency="XTR").pay_in_stars is True
     assert _settings(payment_currency="XTR").online_enabled is True
     assert _settings(payment_currency="RUB").online_enabled is False
     assert _settings(payment_currency="RUB", payment_token="t").online_enabled is True
 
 
-def test_stars_mode_warns_about_useless_provider_token():
+def test_pay_in_stars_warns_about_useless_provider_token():
     problems = _settings(payment_currency="XTR", payment_token="t").validate()
     assert any("Stars" in p for p in problems)
 
@@ -101,3 +104,50 @@ def test_missing_proxy_dependency_explains_itself(monkeypatch):
     monkeypatch.setattr(bot_module, "AiohttpSession", boom)
     with pytest.raises(SystemExit, match="aiohttp-socks"):
         bot_module.create_bot()
+
+
+# ------------------------------------------------------- магазин звёзд
+
+def test_stars_shop_needs_a_way_to_get_paid():
+    problems = _settings(ton_wallet="", payment_token="").validate()
+    assert any("Принимать оплату нечем" in p for p in problems)
+
+
+def test_paying_for_stars_with_stars_is_rejected():
+    problems = _settings(payment_currency="XTR").validate()
+    assert any("платить за них звёздами нельзя" in p for p in problems)
+
+
+def test_minimum_below_fragment_limit_is_rejected():
+    problems = _settings(min_stars=10, star_packages=[10, 50]).validate()
+    assert any("Fragment не продаёт меньше 50" in p for p in problems)
+
+
+def test_packages_below_minimum_are_reported():
+    problems = _settings(min_stars=50, star_packages=[25, 100]).validate()
+    assert any("STAR_PACKAGES" in p for p in problems)
+
+
+def test_fragment_api_mode_requires_credentials():
+    problems = _settings(fragment_mode="api").validate()
+    assert any("FRAGMENT_API_URL" in p for p in problems)
+    assert _settings(fragment_mode="api", fragment_url="https://gate",
+                     fragment_token="t").validate() == []
+
+
+def test_fragment_auto_flag():
+    assert _settings().fragment_auto is False
+    assert _settings(fragment_mode="api", fragment_url="https://gate",
+                     fragment_token="t").fragment_auto is True
+
+
+def test_physical_shop_cannot_use_stars_as_payment():
+    problems = _settings(shop_mode="physical", payment_currency="XTR",
+                         payment_token="").validate()
+    assert any("физических товаров" in p for p in problems)
+
+
+def test_delivery_form_only_for_physical():
+    assert _settings(shop_mode="stars").digital is True
+    assert _settings(shop_mode="digital").digital is True
+    assert _settings(shop_mode="physical").digital is False
